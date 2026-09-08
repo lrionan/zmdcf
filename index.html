@@ -276,9 +276,55 @@ async function loadAppDataAsync() {
       const nonCardFields = DATA_FIELDS.filter((field) => field !== "cards");
       const values = await Promise.all(nonCardFields.map((field) => get(fieldKey(field))));
       const partial = {};
+      const missingFields = [];
       nonCardFields.forEach((field, index) => {
-        if (values[index] !== void 0) partial[field] = values[index];
+        if (values[index] !== void 0) {
+          partial[field] = values[index];
+        } else {
+          missingFields.push(field);
+        }
       });
+      try {
+        const legacyRoot = await get(STORAGE_KEY);
+        if (legacyRoot && typeof legacyRoot === "object") {
+          const mergeCollection = (current, legacy, field) => {
+            if (!Array.isArray(legacy)) return current;
+            if (!Array.isArray(current)) return legacy;
+            if (legacy.length === 0) return current;
+            if (current.length === 0) return legacy;
+            const looksLikeCategory = field.endsWith("Categories") || field === "groups";
+            if (looksLikeCategory) return Array.from(new Set([...legacy, ...current].filter(Boolean)));
+            const getIdentity = (item) => {
+              if (item && typeof item === "object") {
+                if (item.id != null) return `id:${String(item.id)}`;
+                if (item.key != null) return `key:${String(item.key)}`;
+                if (item.uuid != null) return `uuid:${String(item.uuid)}`;
+                if (item.name != null) return `name:${String(item.name)}`;
+                if (item.title != null) return `title:${String(item.title)}`;
+                if (item.fileName != null) return `file:${String(item.fileName)}`;
+              }
+              return `value:${JSON.stringify(item)}`;
+            };
+            const result = [...legacy];
+            const index = new Map(result.map((item, i) => [getIdentity(item), i]));
+            for (const item of current) {
+              const key = getIdentity(item);
+              const existing = index.get(key);
+              if (existing == null) {
+                index.set(key, result.length);
+                result.push(item);
+              } else result[existing] = item;
+            }
+            return result;
+          };
+          for (const field of nonCardFields) {
+            if (legacyRoot[field] === void 0) continue;
+            partial[field] = mergeCollection(partial[field], legacyRoot[field], String(field));
+          }
+        }
+      } catch (recoveryErr) {
+        console.warn("Legacy data recovery read failed", recoveryErr);
+      }
       let cardIds = await get(CARD_INDEX_KEY);
       if (!Array.isArray(cardIds)) {
         const legacyCards = await get(fieldKey("cards"));
@@ -290,7 +336,6 @@ async function loadAppDataAsync() {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
         await set(CARD_INDEX_KEY, cardIds);
-        if (cards.length) await del(fieldKey("cards"));
       }
       const loadedCards = [];
       for (let i = 0; i < cardIds.length; i += 8) {
@@ -374,7 +419,6 @@ function saveAppData(data) {
           }
           for (const staleId of prevMap.keys()) await del(CARD_KEY(staleId));
           await set(CARD_INDEX_KEY, nextIds);
-          await del(fieldKey("cards"));
         } else {
           await set(fieldKey(field), data[field]);
         }
@@ -1200,15 +1244,30 @@ function App() {
       setIsGachaSpinning(false);
     }, 300);
   };
-  const downloadJsonFile = (fileName, data) => {
-    const jsonStr = JSON.stringify(data, null, 2);
-    const blob = new Blob([jsonStr], { type: "application/json;charset=utf-8" });
+  const downloadBlobFile = (blob, fileName) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = fileName.endsWith(".json") ? fileName : `${fileName}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    a.download = fileName;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    const supportsDownload = "download" in a;
+    try {
+      a.click();
+    } finally {
+      a.remove();
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 5e3);
+    if (!supportsDownload) {
+      const opened = window.open(url, "_blank");
+      if (!opened) window.location.href = url;
+    }
+    return true;
+  };
+  const downloadJsonFile = (fileName, data) => {
+    const jsonStr = JSON.stringify(data, null, 2);
+    const blob = new Blob([jsonStr], { type: "application/json;charset=utf-8" });
+    return downloadBlobFile(blob, fileName.endsWith(".json") ? fileName : `${fileName}.json`);
   };
   const formatDateForFileName = (date = /* @__PURE__ */ new Date()) => {
     const y = date.getFullYear();
@@ -3133,10 +3192,10 @@ function App() {
     }
     if (!apiSearchQuery.trim()) return true;
     const q = apiSearchQuery.toLowerCase();
-    const nameMatch = item.name.toLowerCase().includes(q);
+    const nameMatch = String(item.name || "").toLowerCase().includes(q);
     const urlMatch = item.url.toLowerCase().includes(q);
     const descMatch = (item.description || "").toLowerCase().includes(q);
-    const catMatch = (item.category || "").toLowerCase().includes(q);
+    const catMatch = String(item.category || "").toLowerCase().includes(q);
     const keyMatch = item.keys.some(
       (k) => k.key.toLowerCase().includes(q) || (k.memo || "").toLowerCase().includes(q)
     );
@@ -3293,33 +3352,40 @@ function App() {
   const [batchTargetFontCategory, setBatchTargetFontCategory] = useState("");
   const fontsList = appData.fonts || [];
   useEffect(() => {
-    const fList = appData.fonts || [];
     let styleEl = document.getElementById("custom-fonts-style");
     if (!styleEl) {
       styleEl = document.createElement("style");
       styleEl.id = "custom-fonts-style";
       document.head.appendChild(styleEl);
     }
-    const cssRules = fList.map((f) => {
-      const src = f.fileData || f.url;
-      if (!src) return "";
-      return `@font-face {
-  font-family: '${f.fontFamily}';
-  src: url('${src}');
+    const fList = Array.isArray(appData.fonts) ? appData.fonts : [];
+    const active = activePreviewFontId ? fList.find((f) => f && f.id === activePreviewFontId) : null;
+    if (!active || !active.fontFamily) {
+      styleEl.textContent = "";
+      return;
+    }
+    const src = active.fileData || active.url;
+    if (!src) {
+      styleEl.textContent = "";
+      return;
+    }
+    const safeFamily = String(active.fontFamily).replace(/[\\"']/g, "\\$&");
+    const safeSrc = String(src).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    styleEl.textContent = `@font-face {
+  font-family: '${safeFamily}';
+  src: url('${safeSrc}');
   font-display: swap;
 }`;
-    }).join("\n");
-    styleEl.textContent = cssRules;
-  }, [appData.fonts]);
+  }, [appData.fonts, activePreviewFontId]);
   const filteredFonts = fontsList.filter((item) => {
     if (fontCategoryFilter !== "\u5168\u90E8\u5206\u7EC4" && (item.category || "\u9ED8\u8BA4") !== fontCategoryFilter) {
       return false;
     }
     if (!fontSearchQuery.trim()) return true;
     const q = fontSearchQuery.toLowerCase();
-    const nameMatch = item.name.toLowerCase().includes(q);
-    const urlMatch = (item.url || "").toLowerCase().includes(q);
-    const catMatch = (item.category || "").toLowerCase().includes(q);
+    const nameMatch = String(item.name || "").toLowerCase().includes(q);
+    const urlMatch = String(item.url || "").toLowerCase().includes(q);
+    const catMatch = String(item.category || "").toLowerCase().includes(q);
     return nameMatch || urlMatch || catMatch;
   });
   const handleAddFontUrl = () => {
@@ -3541,7 +3607,7 @@ function App() {
     const titleMatch = item.title.toLowerCase().includes(q);
     const authorMatch = (item.author || "").toLowerCase().includes(q);
     const contentMatch = item.content.toLowerCase().includes(q);
-    const catMatch = (item.category || "").toLowerCase().includes(q);
+    const catMatch = String(item.category || "").toLowerCase().includes(q);
     return titleMatch || authorMatch || contentMatch || catMatch;
   });
   const handleAddExtraStoryManual = () => {
@@ -4844,12 +4910,7 @@ ${wb.content || ""}`;
     const pureData = getPureCardDataForExport(rawCardData);
     const jsonStr = JSON.stringify(pureData, null, 2);
     const blob = new Blob([jsonStr], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${getCardDisplayName(card)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlobFile(blob, `${getCardDisplayName(card)}.json`);
     showToast("JSON \u5BFC\u51FA\u6210\u529F\uFF08\u5DF2\u5305\u542B\u6982\u89C8\u3001\u5F00\u573A\u767D\u3001\u4E16\u754C\u4E66\u3001\u6B63\u5219\u4E0E\u6807\u7B7E\uFF09", "success");
   };
   const exportAsPng = async (card) => {
@@ -4878,12 +4939,7 @@ ${wb.content || ""}`;
       const keyword = card.version === "v3" ? "ccv3" : "chara";
       const newPngBuf = injectPngTextChunk(buf, keyword, b64);
       const pngBlob = new Blob([newPngBuf], { type: "image/png" });
-      const url = URL.createObjectURL(pngBlob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${getCardDisplayName(card)}.png`;
-      a.click();
-      URL.revokeObjectURL(url);
+      downloadBlobFile(pngBlob, `${getCardDisplayName(card)}.png`);
       showToast("PNG \u5BFC\u51FA\u6210\u529F\uFF08\u5DF2\u5305\u542B\u6982\u89C8\u3001\u5F00\u573A\u767D\u3001\u4E16\u754C\u4E66\u3001\u6B63\u5219\u4E0E\u6807\u7B7E\uFF09", "success");
     } catch (e) {
       console.error(e);
@@ -5860,9 +5916,9 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                         author
                       ] })
                     ] }),
-                    /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap gap-1", children: [
-                      tags.map((t, idx) => /* @__PURE__ */ jsx("span", { className: "px-1 py-0.5 text-[8px] bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded leading-none", children: t }, idx)),
-                      /* @__PURE__ */ jsx("span", { className: "px-1.5 py-0.5 text-[9px] bg-zinc-200/60 dark:bg-zinc-800 text-zinc-500 rounded ml-auto", children: card.group || "\u9ED8\u8BA4" })
+                    /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1 min-w-0", children: [
+                      /* @__PURE__ */ jsx("div", { className: "flex items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap", children: tags.map((t, idx) => /* @__PURE__ */ jsx("span", { className: "shrink-0 px-1 py-0.5 text-[8px] bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded leading-none", children: t }, idx)) }),
+                      /* @__PURE__ */ jsx("span", { className: "shrink-0 px-1.5 py-0.5 text-[9px] bg-zinc-200/60 dark:bg-zinc-800 text-zinc-500 rounded ml-auto", children: card.group || "\u9ED8\u8BA4" })
                     ] })
                   ] }),
                   !batchMode && /* @__PURE__ */ jsxs("div", { className: "p-2 pt-0 flex gap-1 border-t border-zinc-100 dark:border-zinc-800/60", children: [

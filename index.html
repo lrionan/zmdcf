@@ -61,7 +61,7 @@ html, body {
 
 header {
   padding-top: env(safe-area-inset-top, 0px);
-  height: calc(3.5rem + env(safe-area-inset-top, 0px)) !important;
+  height: calc(var(--app-header-height, 56px) + env(safe-area-inset-top, 0px)) !important;
 }
 
 aside {
@@ -159,10 +159,10 @@ import React2 from "react";
 import ReactDOM from "react-dom/client";
 
 // src/App.tsx
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import mammoth from "mammoth";
 import { Document, Packer, Paragraph, TextRun } from "docx";
-import { unzipSync, strFromU8 } from "fflate";
+import { unzipSync, strFromU8, gzipSync, strToU8 } from "fflate";
 import {
   Menu,
   X,
@@ -193,7 +193,10 @@ import {
   FileCode,
   Save,
   ArrowUpDown,
-  Link2
+  Link2,
+  Github,
+  Settings,
+  Clock
 } from "lucide-react";
 
 // src/utils/storage.ts
@@ -237,6 +240,16 @@ var SPLIT_MARKER_KEY = `${STORAGE_KEY}::__split_v1`;
 var SPLIT_LOCAL_MARKER_KEY = `${STORAGE_KEY}::__split_local_v1`;
 var CARD_INDEX_KEY = `${STORAGE_KEY}::__card_index_v1`;
 var CARD_KEY = (id) => `${STORAGE_KEY}::card::${id}`;
+var CARD_SOURCE_IMAGE_KEY = (id) => `${STORAGE_KEY}::card_source_image::${id}`;
+async function saveCardSourceImage(id, blob) {
+  await set(CARD_SOURCE_IMAGE_KEY(id), blob);
+}
+async function getCardSourceImage(id) {
+  return await get(CARD_SOURCE_IMAGE_KEY(id));
+}
+async function deleteCardSourceImage(id) {
+  await del(CARD_SOURCE_IMAGE_KEY(id));
+}
 var mergeDefaults = (data) => ({
   cards: Array.isArray(data?.cards) ? data.cards : [],
   groups: Array.isArray(data?.groups) && data.groups.length ? data.groups : ["\u9ED8\u8BA4"],
@@ -473,21 +486,46 @@ function getCardGreeting(card) {
   return "";
 }
 function getCardAlternateGreetings(card) {
-  if (card.editHistory?.alternate_greetings && Array.isArray(card.editHistory.alternate_greetings)) {
-    return card.editHistory.alternate_greetings;
+  const normalize = (value) => {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+      if (typeof item === "string") return item;
+      if (item == null) return "";
+      try {
+        return String(item);
+      } catch {
+        return "";
+      }
+    });
+  };
+  if (card.editHistory?.alternate_greetings !== void 0) {
+    return normalize(card.editHistory.alternate_greetings);
   }
   const rd = card.rawData;
-  if (rd?.data?.alternate_greetings) return rd.data.alternate_greetings;
-  if (rd?.alternate_greetings) return rd.alternate_greetings;
+  if (rd?.data?.alternate_greetings !== void 0) return normalize(rd.data.alternate_greetings);
+  if (rd?.alternate_greetings !== void 0) return normalize(rd.alternate_greetings);
   return [];
 }
 function getCardWorldBook(card) {
-  if (card.editHistory?.character_book) return card.editHistory.character_book;
+  const normalize = (value) => {
+    if (!value || typeof value !== "object") return null;
+    const wb = { ...value };
+    const rawEntries = wb.entries;
+    if (Array.isArray(rawEntries)) {
+      wb.entries = rawEntries.map((entry) => entry && typeof entry === "object" ? entry : { content: String(entry ?? "") });
+    } else if (rawEntries && typeof rawEntries === "object") {
+      wb.entries = Object.values(rawEntries);
+    } else {
+      wb.entries = [];
+    }
+    return wb;
+  };
+  if (card.editHistory?.character_book) return normalize(card.editHistory.character_book);
   const rd = card.rawData;
-  if (rd?.data?.character_book) return rd.data.character_book;
-  if (rd?.character_book) return rd.character_book;
-  if (rd?.extensions?.character_book) return rd.extensions.character_book;
-  if (rd?.data?.extensions?.character_book) return rd.data.extensions.character_book;
+  if (rd?.data?.character_book) return normalize(rd.data.character_book);
+  if (rd?.character_book) return normalize(rd.character_book);
+  if (rd?.extensions?.character_book) return normalize(rd.extensions.character_book);
+  if (rd?.data?.extensions?.character_book) return normalize(rd.data.extensions.character_book);
   return null;
 }
 function getCardRegex(card) {
@@ -760,26 +798,7 @@ function calcCrc(table, bytes) {
   }
   return (c ^ 4294967295) >>> 0;
 }
-function injectPngTextChunk(arrayBuffer, keyword, value) {
-  const dv = new DataView(arrayBuffer);
-  let offset = 8;
-  let iendOffset = -1;
-  while (offset < dv.byteLength) {
-    if (offset + 8 > dv.byteLength) break;
-    const length = dv.getUint32(offset);
-    const type = String.fromCharCode(
-      dv.getUint8(offset + 4),
-      dv.getUint8(offset + 5),
-      dv.getUint8(offset + 6),
-      dv.getUint8(offset + 7)
-    );
-    if (type === "IEND") {
-      iendOffset = offset;
-      break;
-    }
-    offset = offset + 8 + length + 4;
-  }
-  if (iendOffset === -1) throw new Error("\u65E0\u6548\u7684 PNG \u7ED3\u6784: \u672A\u627E\u5230 IEND");
+function makePngTextChunk(keyword, value) {
   const encoder = new TextEncoder();
   const kwBytes = encoder.encode(keyword);
   const valBytes = encoder.encode(value);
@@ -787,27 +806,67 @@ function injectPngTextChunk(arrayBuffer, keyword, value) {
   chunkData.set(kwBytes, 0);
   chunkData[kwBytes.length] = 0;
   chunkData.set(valBytes, kwBytes.length + 1);
-  const crcTable = makeCrcTable();
-  const crc = calcCrc(crcTable, chunkData);
-  const chunkLength = chunkData.length;
-  const totalChunkLen = 4 + 4 + chunkData.length + 4;
-  const newBuf = new Uint8Array(arrayBuffer.byteLength + totalChunkLen);
-  newBuf.set(new Uint8Array(arrayBuffer, 0, iendOffset), 0);
-  let pos = iendOffset;
-  const ndv = new DataView(newBuf.buffer);
-  ndv.setUint32(pos, chunkLength);
-  pos += 4;
-  const typeStr = "tEXt";
-  for (let i = 0; i < 4; i++) {
-    newBuf[pos + i] = typeStr.charCodeAt(i);
+  const crc = calcCrc(makeCrcTable(), new Uint8Array([
+    116,
+    69,
+    88,
+    116,
+    // tEXt
+    ...chunkData
+  ]));
+  const out = new Uint8Array(4 + 4 + chunkData.length + 4);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, chunkData.length);
+  out.set([116, 69, 88, 116], 4);
+  out.set(chunkData, 8);
+  dv.setUint32(8 + chunkData.length, crc);
+  return out;
+}
+function injectTavernCardChunks(arrayBuffer, charaValue, ccv3Value) {
+  const input = new Uint8Array(arrayBuffer);
+  const dv = new DataView(arrayBuffer);
+  const signature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  for (let i = 0; i < 8; i++) {
+    if (input[i] !== signature[i]) throw new Error("\u65E0\u6548\u7684 PNG \u6587\u4EF6");
   }
-  pos += 4;
-  newBuf.set(chunkData, pos);
-  pos += chunkData.length;
-  ndv.setUint32(pos, crc);
-  pos += 4;
-  newBuf.set(new Uint8Array(arrayBuffer, iendOffset), pos);
-  return newBuf.buffer;
+  const kept = [input.slice(0, 8)];
+  let offset = 8;
+  let iendChunk = null;
+  while (offset + 12 <= input.length) {
+    const length = dv.getUint32(offset);
+    const total = 12 + length;
+    if (offset + total > input.length) throw new Error("PNG chunk \u957F\u5EA6\u5F02\u5E38");
+    const typeBytes = input.subarray(offset + 4, offset + 8);
+    const type = String.fromCharCode(...typeBytes);
+    const chunk = input.slice(offset, offset + total);
+    let remove = false;
+    if (type === "tEXt" || type === "iTXt" || type === "zTXt") {
+      const data = input.subarray(offset + 8, offset + 8 + length);
+      let k = 0;
+      while (k < data.length && data[k] !== 0) k++;
+      const keyword = new TextDecoder("utf-8").decode(data.subarray(0, k)).toLowerCase();
+      remove = keyword === "chara" || keyword === "ccv3";
+    }
+    if (type === "IEND") {
+      iendChunk = chunk;
+      break;
+    }
+    if (!remove) kept.push(chunk);
+    offset += total;
+  }
+  if (!iendChunk) throw new Error("\u65E0\u6548\u7684 PNG \u7ED3\u6784\uFF1A\u672A\u627E\u5230 IEND");
+  kept.push(makePngTextChunk("chara", charaValue));
+  if (ccv3Value) kept.push(makePngTextChunk("ccv3", ccv3Value));
+  kept.push(iendChunk);
+  let totalSize = 0;
+  for (const chunk of kept) totalSize += chunk.length;
+  const out = new Uint8Array(totalSize);
+  let pos = 0;
+  for (const chunk of kept) {
+    out.set(chunk, pos);
+    pos += chunk.length;
+  }
+  return out.buffer;
 }
 function getPureCardDataForExport(cardData) {
   const clean = JSON.parse(JSON.stringify(cardData));
@@ -903,7 +962,7 @@ async function parseCardFile(file) {
     if (!cardData) {
       throw new Error("\u65E0\u6CD5\u8BC6\u522B\u7684 PNG \u89D2\u8272\u5361\u683C\u5F0F (\u672A\u5305\u542B chara \u6216 ccv3 \u6570\u636E)");
     }
-    const originalCover = await fileToDataURL(file);
+    const originalCover = await processImageFile(file, 360, 540);
     const recognizedName = cardData?.name || cardData?.char_name || cardData?.data?.name || file.name.replace(/\.[^/.]+$/, "");
     return {
       id,
@@ -919,7 +978,7 @@ async function parseCardFile(file) {
       coverImage: originalCover,
       extraCovers: [],
       activeCoverIndex: 0,
-      screenshots: { authorsNote: [], favoriteScenes: [] },
+      screenshots: { authorsNote: [], authorsNoteDescription: "", favoriteScenes: [] },
       edited: false,
       editHistory: {},
       createdAt: Date.now(),
@@ -960,7 +1019,7 @@ async function parseCardFile(file) {
       coverImage: null,
       extraCovers: [],
       activeCoverIndex: 0,
-      screenshots: { authorsNote: [], favoriteScenes: [] },
+      screenshots: { authorsNote: [], authorsNoteDescription: "", favoriteScenes: [] },
       edited: false,
       editHistory: {},
       createdAt: Date.now(),
@@ -983,20 +1042,68 @@ function estimateTokens(text) {
   const nonCjkTokenCount = wordMatches.length;
   return Math.ceil(cjkCount * 1.35 + nonCjkTokenCount);
 }
+var CardDetailTabErrorBoundary = class extends React.Component {
+  constructor() {
+    super(...arguments);
+    __publicField(this, "state", { hasError: false });
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error) {
+    console.error("ST\u89D2\u8272\u5361\u8BE6\u60C5\u677F\u5757\u6E32\u67D3\u5F02\u5E38", error);
+  }
+  componentDidUpdate(prevProps) {
+    if (prevProps.tabKey !== this.props.tabKey && this.state.hasError) this.setState({ hasError: false });
+  }
+  render() {
+    if (this.state.hasError) return /* @__PURE__ */ jsxs("div", { className: "p-6 rounded-2xl border border-zinc-200 bg-zinc-50 text-center space-y-2", children: [
+      /* @__PURE__ */ jsx("div", { className: "text-sm font-bold text-zinc-800", children: "\u8FD9\u4E2A\u8BE6\u60C5\u677F\u5757\u7684\u6570\u636E\u683C\u5F0F\u5F02\u5E38" }),
+      /* @__PURE__ */ jsx("div", { className: "text-xs text-zinc-400", children: "\u5DF2\u62E6\u622A\u5F02\u5E38\uFF0C\u907F\u514D\u6574\u4E2A\u5DE5\u5177\u7BB1\u7070\u5C4F\u3002\u8BF7\u5207\u6362\u5230\u5176\u4ED6\u677F\u5757\u7EE7\u7EED\u4F7F\u7528\u3002" })
+    ] });
+    return this.props.children;
+  }
+};
 function sortItemList(items, sortOrder, getName, getCreatedAt) {
   if (sortOrder === "default") return items;
   const list = [...items];
-  if (sortOrder === "az") {
-    return list.sort((a, b) => getName(a).localeCompare(getName(b), "zh-CN", { numeric: true, sensitivity: "base" }));
-  }
-  if (sortOrder === "za") {
-    return list.sort((a, b) => getName(b).localeCompare(getName(a), "zh-CN", { numeric: true, sensitivity: "base" }));
+  const safeName = (item) => {
+    try {
+      return String(getName(item) ?? "");
+    } catch {
+      return "";
+    }
+  };
+  const safeTime = (item) => {
+    try {
+      const value = getCreatedAt ? getCreatedAt(item) : 0;
+      const n = typeof value === "number" ? value : Number(value);
+      return Number.isFinite(n) ? n : 0;
+    } catch {
+      return 0;
+    }
+  };
+  if (sortOrder === "az" || sortOrder === "za") {
+    const compareNames = (a, b) => {
+      const an = safeName(a);
+      const bn = safeName(b);
+      try {
+        const result = an.localeCompare(bn, "zh-CN", { numeric: true, sensitivity: "base" });
+        return Number.isFinite(result) ? result : 0;
+      } catch {
+        const aa = an.toLocaleLowerCase();
+        const bb = bn.toLocaleLowerCase();
+        return aa < bb ? -1 : aa > bb ? 1 : 0;
+      }
+    };
+    list.sort(compareNames);
+    return sortOrder === "za" ? list.reverse() : list;
   }
   if (sortOrder === "newest") {
-    return list.sort((a, b) => (getCreatedAt ? getCreatedAt(b) : 0) - (getCreatedAt ? getCreatedAt(a) : 0));
+    return list.sort((a, b) => safeTime(b) - safeTime(a));
   }
   if (sortOrder === "oldest") {
-    return list.sort((a, b) => (getCreatedAt ? getCreatedAt(a) : 0) - (getCreatedAt ? getCreatedAt(b) : 0));
+    return list.sort((a, b) => safeTime(a) - safeTime(b));
   }
   return list;
 }
@@ -1088,6 +1195,23 @@ function App() {
   });
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [currentPage, setCurrentPage] = useState("st-cards");
+  const [topHeaderHeight, setTopHeaderHeight] = useState(() => {
+    const saved = Number(localStorage.getItem("toolbox_top_header_height"));
+    return Number.isFinite(saved) && saved >= 44 && saved <= 100 ? saved : 56;
+  });
+  const [githubAutoBackupEnabled, setGithubAutoBackupEnabled] = useState(() => localStorage.getItem("toolbox_github_auto_backup") === "1");
+  const [githubBackupReminderEnabled, setGithubBackupReminderEnabled] = useState(() => localStorage.getItem("toolbox_github_backup_reminder") === "1");
+  const [showGithubBackupReminder, setShowGithubBackupReminder] = useState(false);
+  const githubReminderShownRef = useRef(false);
+  const githubAutoBackupRunningRef = useRef(false);
+  const [settingsBackupSelection, setSettingsBackupSelection] = useState([]);
+  const [settingsBackupMode, setSettingsBackupMode] = useState("all");
+  const [githubFileName, setGithubFileName] = useState(() => localStorage.getItem("toolbox_github_file_name") || "toolbox-backup");
+  const [githubRepo, setGithubRepo] = useState(() => localStorage.getItem("toolbox_github_repo") || "");
+  const [githubUsername, setGithubUsername] = useState(() => localStorage.getItem("toolbox_github_username") || "");
+  const [githubToken, setGithubToken] = useState(() => localStorage.getItem("toolbox_github_token") || "");
+  const [isGithubBackingUp, setIsGithubBackingUp] = useState(false);
+  const [lastGithubBackupTime, setLastGithubBackupTime] = useState(() => localStorage.getItem("toolbox_last_github_backup") || "");
   const [userPersonaSearch, setUserPersonaSearch] = useState("");
   const [userPersonaSortOrder, setUserPersonaSortOrder] = useState("default");
   const [userPersonaGroup, setUserPersonaGroup] = useState("\u5168\u90E8");
@@ -1129,7 +1253,7 @@ function App() {
   const [currentGroup, setCurrentGroup] = useState("\u5168\u90E8");
   const [batchMode, setBatchMode] = useState(false);
   const [selectedCardIds, setSelectedCardIds] = useState([]);
-  const CARD_PAGE_SIZE = 90;
+  const CARD_PAGE_SIZE = 36;
   const [cardVisibleCount, setCardVisibleCount] = useState(CARD_PAGE_SIZE);
   const cardLoadMoreRef = useRef(null);
   const [detailCardId, setDetailCardId] = useState(null);
@@ -1149,6 +1273,8 @@ function App() {
   const [showAddAltGreetingModal, setShowAddAltGreetingModal] = useState(false);
   const [newAltGreetingInputText, setNewAltGreetingInputText] = useState("");
   const [customGreetingUsername, setCustomGreetingUsername] = useState("");
+  const [greetingVisibleCount, setGreetingVisibleCount] = useState(8);
+  const [worldBookVisibleCount, setWorldBookVisibleCount] = useState(12);
   const applyCustomGreetingUsername = (text, username = customGreetingUsername) => {
     if (!username.trim()) return text;
     return String(text || "").replace(/\{\{user\}\}/gi, username);
@@ -1245,23 +1371,31 @@ function App() {
     }, 300);
   };
   const downloadBlobFile = (blob, fileName) => {
+    if (!(blob instanceof Blob) || blob.size <= 0) {
+      throw new Error("\u5BFC\u51FA\u6587\u4EF6\u4E3A\u7A7A\uFF0C\u672A\u6267\u884C\u4E0B\u8F7D");
+    }
+    const safeName = String(fileName || "toolbox-export").normalize("NFC").replace(/[\\/:*?"<>|\u0000-\u001F]/g, "_").slice(0, 180) || "toolbox-export";
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = fileName;
+    a.download = safeName;
+    a.rel = "noopener";
     a.style.display = "none";
     document.body.appendChild(a);
     const supportsDownload = "download" in a;
+    const ua = navigator.userAgent || "";
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
     try {
-      a.click();
+      if (isIOS || !supportsDownload) {
+        const opened = window.open(url, "_blank");
+        if (!opened) window.location.href = url;
+      } else {
+        a.click();
+      }
     } finally {
       a.remove();
     }
-    setTimeout(() => URL.revokeObjectURL(url), 5e3);
-    if (!supportsDownload) {
-      const opened = window.open(url, "_blank");
-      if (!opened) window.location.href = url;
-    }
+    setTimeout(() => URL.revokeObjectURL(url), 6e4);
     return true;
   };
   const downloadJsonFile = (fileName, data) => {
@@ -1296,6 +1430,7 @@ function App() {
     await new Promise((resolve) => setTimeout(resolve, 30));
     const fileName = `toolbox-${formatDateForFileName()}.json`;
     const keys = Object.keys(appData).filter((key) => key !== "fonts" && key !== "fontCategories");
+    const sections = SETTINGS_SECTION_IDS;
     const encoder = new TextEncoder();
     try {
       const picker = window.showSaveFilePicker;
@@ -1309,7 +1444,7 @@ function App() {
         const write = async (text) => {
           await writable.write(encoder.encode(text));
         };
-        await write("{");
+        await write('{"format":"toolbox-backup","version":2,"exportedAt":' + JSON.stringify((/* @__PURE__ */ new Date()).toISOString()) + ',"sections":' + JSON.stringify(sections) + ',"data":{');
         for (const key of keys) {
           if (!firstField) await write(",");
           firstField = false;
@@ -1328,7 +1463,7 @@ function App() {
           }
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
-        await write("}");
+        await write("}}");
         await writable.close();
         showToast("\u5168\u90E8\u6570\u636E\u5BFC\u51FA\u6210\u529F\uFF08\u4E0D\u542B\u5B57\u4F53\uFF09\uFF01", "success");
         return;
@@ -1340,7 +1475,7 @@ function App() {
       setIsExportingBackup(false);
     }
     try {
-      const parts = ["{"];
+      const parts = ['{"format":"toolbox-backup","version":2,"exportedAt":', JSON.stringify((/* @__PURE__ */ new Date()).toISOString()), ',"sections":', JSON.stringify(sections), ',"data":{'];
       for (let idx = 0; idx < keys.length; idx++) {
         const key = keys[idx];
         const value = appData[key];
@@ -1359,7 +1494,7 @@ function App() {
         }
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
-      parts.push("}");
+      parts.push("}}");
       const blob = new Blob(parts, { type: "application/json;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -3667,6 +3802,18 @@ function App() {
         return { title, content: content || part };
       }).filter((item) => item.content.trim().length > 0);
     }
+    const paragraphParts = normalized.split(/\n\s*\n+/).map((part) => part.trim()).filter(Boolean);
+    if (paragraphParts.length > 1) {
+      return paragraphParts.map((part, idx) => {
+        const partLines = part.split("\n");
+        const first = partLines[0].trim();
+        const looksLikeTitle = first.length > 0 && first.length <= 50 && partLines.length > 1;
+        return {
+          title: looksLikeTitle ? first : `${baseName} - \u5C0F\u5267\u573A${idx + 1}`,
+          content: (looksLikeTitle ? partLines.slice(1).join("\n") : part).trim()
+        };
+      }).filter((item) => item.content.trim().length > 0);
+    }
     return [{ title: baseName, content: normalized }];
   };
   const buildExtraStoryEntries = (fileName, rawText, category) => {
@@ -3748,6 +3895,18 @@ function App() {
   };
   const updateExtraStoryImportPreviewItem = (id, patch) => {
     setExtraStoryImportPreview((prev) => prev ? prev.map((item) => item.id === id ? { ...item, ...patch, updatedAt: Date.now() } : item) : prev);
+  };
+  const removeExtraStoryImportPreviewItem = (id) => {
+    setExtraStoryImportPreview((prev) => {
+      const next = prev ? prev.filter((item) => item.id !== id) : prev;
+      if (!next?.length) {
+        setExtraStoryImportPreview(null);
+        setSelectedExtraStoryImportIds([]);
+        return null;
+      }
+      return next;
+    });
+    setSelectedExtraStoryImportIds((ids) => ids.filter((x) => x !== id));
   };
   const mergeSelectedExtraStoryImports = () => {
     if (!extraStoryImportPreview || selectedExtraStoryImportIds.length < 2) {
@@ -3948,6 +4107,19 @@ function App() {
   };
   const toggleChatImportSelection = (id) => {
     setSelectedChatImportIds((ids) => ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]);
+  };
+  const removeChatImportPreviewItem = (id) => {
+    setChatImportPreview((prev) => {
+      const next = prev ? prev.filter((item) => item.id !== id) : prev;
+      if (!next?.length) {
+        setChatImportPreview(null);
+        setSelectedChatImportIds([]);
+        setChatImportSourceName("");
+        return null;
+      }
+      return next;
+    });
+    setSelectedChatImportIds((ids) => ids.filter((x) => x !== id));
   };
   const mergeSelectedChatImports = () => {
     if (!chatImportPreview || selectedChatImportIds.length < 2) {
@@ -4692,6 +4864,331 @@ ${wb.content || ""}`;
     "api-storage": { dataKeys: ["apis", "apiCategories"], label: "API \u5B58\u50A8" }
   };
   const getCurrentSectionConfig = () => SECTION_DATA_CONFIG[currentPage] || null;
+  const SETTINGS_SECTION_IDS = Object.keys(SECTION_DATA_CONFIG);
+  const getBackupPayload = (sectionIds = null) => {
+    const ids = sectionIds && sectionIds.length ? sectionIds : SETTINGS_SECTION_IDS;
+    const data = {};
+    for (const id of ids) {
+      const config = SECTION_DATA_CONFIG[id];
+      if (!config) continue;
+      for (const key of config.dataKeys) {
+        if (key === "fonts" || key === "fontCategories") continue;
+        data[key] = appData[key] ?? [];
+      }
+    }
+    return {
+      format: "toolbox-backup",
+      version: 2,
+      exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+      sections: ids.filter((id) => !!SECTION_DATA_CONFIG[id]),
+      data
+    };
+  };
+  const exportSelectedBackup = async () => {
+    if (settingsBackupMode === "all") {
+      await handleExportFullBackup();
+      return;
+    }
+    if (!settingsBackupSelection.length) {
+      showToast("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8981\u5BFC\u51FA\u7684\u677F\u5757", "error");
+      return;
+    }
+    try {
+      const payload = getBackupPayload(settingsBackupSelection);
+      downloadJsonFile(`toolbox-${formatDateForFileName()}-\u90E8\u5206\u5907\u4EFD.json`, payload);
+      showToast(`\u5DF2\u5BFC\u51FA ${settingsBackupSelection.length} \u4E2A\u677F\u5757`, "success");
+    } catch (err) {
+      console.error("Export selected backup failed", err);
+      showToast(`\u5BFC\u51FA\u5931\u8D25\uFF1A${err?.message || String(err)}`, "error");
+    }
+  };
+  const handleSettingsBackupImport = async (file) => {
+    if (isImportingBackup) return;
+    setIsImportingBackup(true);
+    showToast("\u6B63\u5728\u8BFB\u53D6\u5907\u4EFD\u6587\u4EF6\uFF0C\u6570\u636E\u91CF\u8F83\u5927\u65F6\u8BF7\u7A0D\u5019\u2026", "info");
+    try {
+      const text = await file.text();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const parsed = JSON.parse(text);
+      const sourceData = parsed?.data && typeof parsed.data === "object" ? parsed.data : parsed;
+      if (!sourceData || typeof sourceData !== "object") throw new Error("\u5907\u4EFD\u6587\u4EF6\u683C\u5F0F\u4E0D\u6B63\u786E");
+      const availableSections = Array.isArray(parsed?.sections) ? parsed.sections.filter((id) => !!SECTION_DATA_CONFIG[id]) : [];
+      const selectedIds = settingsBackupMode === "all" ? SETTINGS_SECTION_IDS : settingsBackupSelection;
+      if (settingsBackupMode === "sections" && !selectedIds.length) {
+        throw new Error("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8981\u5BFC\u5165\u7684\u677F\u5757");
+      }
+      const nextData = { ...appData };
+      let imported = 0;
+      for (const id of selectedIds) {
+        const config = SECTION_DATA_CONFIG[id];
+        if (!config) continue;
+        if (availableSections.length && !availableSections.includes(id)) continue;
+        let sectionHasData = false;
+        for (const key of config.dataKeys) {
+          if (key === "fonts" || key === "fontCategories") continue;
+          if (sourceData[key] !== void 0) {
+            if (!Array.isArray(sourceData[key])) throw new Error(`\u6570\u636E\u5B57\u6BB5\u300C${key}\u300D\u683C\u5F0F\u4E0D\u6B63\u786E`);
+            nextData[key] = sourceData[key];
+            sectionHasData = true;
+          }
+        }
+        if (sectionHasData) imported++;
+      }
+      if (!imported) throw new Error("\u5907\u4EFD\u6587\u4EF6\u4E2D\u6CA1\u6709\u627E\u5230\u6240\u9009\u677F\u5757\u7684\u6570\u636E");
+      updateAppData(nextData);
+      showToast(`\u5BFC\u5165\u6210\u529F\uFF0C\u5DF2\u8986\u76D6 ${imported} \u4E2A\u677F\u5757`, "success");
+    } catch (err) {
+      console.error("Import settings backup failed", err);
+      showToast(`\u5BFC\u5165\u5931\u8D25\uFF1A${err?.message || String(err)}`, "error");
+    } finally {
+      setIsImportingBackup(false);
+    }
+  };
+  const toggleBackupSection = (id) => {
+    setSettingsBackupSelection((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]);
+  };
+  const performGithubBackup = async () => {
+    if (isGithubBackingUp) return;
+    const rawUsername = githubUsername.trim().replace(/^\s+|\s+$/g, "");
+    const rawRepo = githubRepo.trim().replace(/^\s+|\s+$/g, "");
+    const normalizedRepoInput = rawRepo.replace(/^https?:\/\/(?:www\.)?github\.com\//i, "").replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+    let owner = rawUsername;
+    let repo = normalizedRepoInput;
+    if (normalizedRepoInput.includes("/")) {
+      const parts = normalizedRepoInput.split("/").filter(Boolean);
+      if (parts.length >= 2) {
+        owner = parts[0];
+        repo = parts[1];
+      }
+    }
+    owner = owner.replace(/^@+/, "").trim();
+    repo = repo.trim();
+    const token = githubToken.trim();
+    let fileName = githubFileName.trim().replace(/\\/g, "_").replace(/\//g, "_");
+    if (!owner || !repo || !token || !fileName) {
+      showToast("\u8BF7\u586B\u5199 GitHub \u7528\u6237\u540D\u3001\u4ED3\u5E93\u540D\u3001\u6587\u4EF6\u540D\u548C Token\uFF1B\u4ED3\u5E93\u4E5F\u652F\u6301\u586B\u5199 owner/repo", "error");
+      return;
+    }
+    if (owner.includes("/") || repo.includes("/")) {
+      showToast("GitHub \u4ED3\u5E93\u683C\u5F0F\u4E0D\u6B63\u786E\uFF0C\u8BF7\u586B\u5199\u201C\u7528\u6237\u540D + \u4ED3\u5E93\u540D\u201D\uFF0C\u6216\u5728\u4ED3\u5E93\u540D\u4E2D\u586B\u5199 owner/repo", "error");
+      return;
+    }
+    setIsGithubBackingUp(true);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const sleep = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+    const encodeBase64 = (bytes) => {
+      let binary = "";
+      const step = 32768;
+      for (let i = 0; i < bytes.length; i += step) {
+        const end = Math.min(i + step, bytes.length);
+        let piece = "";
+        for (let j = i; j < end; j++) piece += String.fromCharCode(bytes[j]);
+        binary += piece;
+      }
+      return btoa(binary);
+    };
+    const fetchWithTimeout = async (url, options, timeout = 3e4) => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeout);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        window.clearTimeout(timer);
+      }
+    };
+    try {
+      const selectedIds = settingsBackupMode === "all" ? SETTINGS_SECTION_IDS : settingsBackupSelection;
+      if (settingsBackupMode === "sections" && !selectedIds.length) {
+        throw new Error("\u8BF7\u81F3\u5C11\u9009\u62E9\u4E00\u4E2A\u8981\u5907\u4EFD\u7684\u677F\u5757");
+      }
+      const files = [];
+      const sectionList = selectedIds.filter((id) => !!SECTION_DATA_CONFIG[id] && id !== "fonts");
+      const backupRoot = fileName.replace(/\.json$/i, "") || "toolbox-backup";
+      const cardsChunkSize = 12;
+      for (const sectionId of sectionList) {
+        const config = SECTION_DATA_CONFIG[sectionId];
+        if (!config) continue;
+        if (sectionId === "st-cards") {
+          const cards = Array.isArray(appData.cards) ? appData.cards : [];
+          const groups = Array.isArray(appData.groups) ? appData.groups : [];
+          const total = Math.max(1, Math.ceil(cards.length / cardsChunkSize));
+          if (!cards.length) {
+            files.push({ path: `${backupRoot}/sections/st-cards-001.json.gz`, kind: "gzip-json", sectionId, index: 1, total });
+          } else {
+            for (let i = 0; i < cards.length; i += cardsChunkSize) {
+              const index = Math.floor(i / cardsChunkSize) + 1;
+              files.push({ path: `${backupRoot}/sections/st-cards-${String(index).padStart(3, "0")}.json.gz`, kind: "gzip-json", sectionId, index, total });
+            }
+          }
+          files.push({ path: `${backupRoot}/sections/st-cards-groups.json`, kind: "json", sectionId });
+        } else {
+          files.push({ path: `${backupRoot}/sections/${sectionId}.json.gz`, kind: "gzip-json", sectionId });
+        }
+      }
+      const manifest = {
+        format: "toolbox-github-backup",
+        version: 3,
+        exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        sourceFormat: "toolbox-backup",
+        sections: sectionList,
+        cardChunkSize: cardsChunkSize,
+        files: files.map((f) => ({ path: f.path, section: f.sectionId || null, index: f.index || null, total: f.total || null, encoding: f.kind })),
+        note: "\u6B64\u5907\u4EFD\u91C7\u7528\u5206\u5757+gzip\u683C\u5F0F\uFF0C\u4E13\u4E3A\u5927\u6570\u636E\u91CF\u548C\u79FB\u52A8\u6D4F\u89C8\u5668\u4F4E\u5185\u5B58\u73AF\u5883\u8BBE\u8BA1\u3002\u4E0D\u8981\u5220\u9664\u540C\u76EE\u5F55\u4E0B\u7684 manifest.json\u3002"
+      };
+      const repoBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+      const base = `${repoBase}/contents/`;
+      const headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28"
+      };
+      const repoCheck = await fetchWithTimeout(repoBase, { headers }, 2e4);
+      if (!repoCheck.ok) {
+        const detail = await repoCheck.text();
+        if (repoCheck.status === 404) {
+          throw new Error(`\u627E\u4E0D\u5230 GitHub \u4ED3\u5E93\u300C${owner}/${repo}\u300D\u3002\u8BF7\u786E\u8BA4\u7528\u6237\u540D/\u4ED3\u5E93\u540D\u6B63\u786E\uFF0C\u5E76\u786E\u8BA4 Token \u5BF9\u8BE5\u4ED3\u5E93\u6709\u8BBF\u95EE\u6743\u9650\uFF1B\u5982\u679C\u4ED3\u5E93\u662F\u79C1\u6709\u4ED3\u5E93\uFF0CToken \u5FC5\u987B\u5305\u542B\u8BE5\u4ED3\u5E93\u7684 Contents \u5199\u5165\u6743\u9650\u3002`);
+        }
+        if (repoCheck.status === 401) {
+          throw new Error("GitHub Token \u65E0\u6548\u6216\u5DF2\u8FC7\u671F\uFF08HTTP 401\uFF09\uFF0C\u8BF7\u91CD\u65B0\u586B\u5199 Token\u3002");
+        }
+        if (repoCheck.status === 403) {
+          throw new Error("GitHub \u62D2\u7EDD\u8BBF\u95EE\uFF08HTTP 403\uFF09\uFF0C\u8BF7\u68C0\u67E5 Token \u6743\u9650\u3001\u4ED3\u5E93\u8BBF\u95EE\u6743\u9650\u6216 API \u9650\u6D41\u3002");
+        }
+        throw new Error(`\u9A8C\u8BC1 GitHub \u4ED3\u5E93\u5931\u8D25\uFF08HTTP ${repoCheck.status}\uFF09${detail ? `\uFF1A${detail.slice(0, 180)}` : ""}`);
+      }
+      const putFile = async (path, contentBytes, message) => {
+        const url = `${base}${path.split("/").map(encodeURIComponent).join("/")}`;
+        let sha;
+        const existing = await fetchWithTimeout(url, { headers }, 2e4);
+        if (existing.ok) {
+          const existingJson = await existing.json();
+          sha = existingJson?.sha;
+        } else if (existing.status !== 404) {
+          const detail = await existing.text();
+          throw new Error(`\u8BFB\u53D6 GitHub \u6587\u4EF6\u5931\u8D25\uFF08HTTP ${existing.status}\uFF09${detail ? `\uFF1A${detail.slice(0, 160)}` : ""}`);
+        }
+        const response = await fetchWithTimeout(url, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            message,
+            content: encodeBase64(contentBytes),
+            ...sha ? { sha } : {}
+          })
+        }, 45e3);
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`\u4E0A\u4F20\u300C${path.split("/").pop()}\u300D\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail ? `\uFF1A${detail.slice(0, 180)}` : ""}`);
+        }
+      };
+      await putFile(`${backupRoot}/manifest.json`, strToU8(JSON.stringify(manifest, null, 2)), "Toolbox backup manifest");
+      await sleep(0);
+      let completed = 0;
+      const totalFiles = files.length;
+      for (const file of files) {
+        completed++;
+        if (file.sectionId === "st-cards") {
+          const cards = Array.isArray(appData.cards) ? appData.cards : [];
+          if (file.path.endsWith("groups.json")) {
+            const payload = {
+              format: "toolbox-backup-chunk",
+              version: 3,
+              section: "st-cards",
+              data: { groups: Array.isArray(appData.groups) ? appData.groups : [] }
+            };
+            await putFile(file.path, strToU8(JSON.stringify(payload)), `Toolbox backup ST cards groups`);
+          } else {
+            const index = file.index || 1;
+            const begin = (index - 1) * cardsChunkSize;
+            const chunk = cards.slice(begin, begin + cardsChunkSize);
+            const payload = {
+              format: "toolbox-backup-chunk",
+              version: 3,
+              section: "st-cards",
+              index,
+              total: file.total || 1,
+              data: { cards: chunk }
+            };
+            const compressed = gzipSync(strToU8(JSON.stringify(payload)), { level: 6 });
+            await putFile(file.path, compressed, `Toolbox backup ST cards ${index}/${file.total || 1}`);
+          }
+        } else {
+          const config = SECTION_DATA_CONFIG[file.sectionId || ""];
+          const data = {};
+          if (config) {
+            for (const key of config.dataKeys) {
+              if (key === "fonts" || key === "fontCategories") continue;
+              data[key] = appData[key] ?? [];
+            }
+          }
+          const payload = {
+            format: "toolbox-backup-chunk",
+            version: 3,
+            section: file.sectionId,
+            data
+          };
+          const compressed = gzipSync(strToU8(JSON.stringify(payload)), { level: 6 });
+          await putFile(file.path, compressed, `Toolbox backup ${config?.label || file.sectionId}`);
+        }
+        showToast(`GitHub \u5907\u4EFD\u4E2D\uFF1A${completed}/${totalFiles}`, "info");
+        await sleep(0);
+      }
+      const now = /* @__PURE__ */ new Date();
+      const displayTime = now.toLocaleString();
+      setLastGithubBackupTime(displayTime);
+      localStorage.setItem("toolbox_last_github_backup", displayTime);
+      localStorage.setItem("toolbox_last_github_backup_iso", now.toISOString());
+      githubReminderShownRef.current = false;
+      showToast(`GitHub \u5907\u4EFD\u6210\u529F\uFF01\u5171 ${totalFiles} \u4E2A\u6587\u4EF6`, "success");
+    } catch (err) {
+      console.error("GitHub backup failed", err);
+      const message = err?.name === "AbortError" ? "\u8BF7\u6C42\u8D85\u65F6\uFF0C\u8BF7\u68C0\u67E5\u7F51\u7EDC\u6216 GitHub Token \u6743\u9650" : err?.message || String(err);
+      showToast(`GitHub \u5907\u4EFD\u5931\u8D25\uFF1A${message}`, "error");
+    } finally {
+      setIsGithubBackingUp(false);
+    }
+  };
+  useEffect(() => {
+    if (!appDataHydrated) return;
+    const DAY = 24 * 60 * 60 * 1e3;
+    const INTERVAL = 2 * DAY;
+    const getLastBackupAt = () => {
+      const iso = localStorage.getItem("toolbox_last_github_backup_iso");
+      if (iso) {
+        const t = Date.parse(iso);
+        if (Number.isFinite(t)) return t;
+      }
+      const legacy = localStorage.getItem("toolbox_last_github_backup");
+      if (legacy) {
+        const t = Date.parse(legacy);
+        if (Number.isFinite(t)) return t;
+      }
+      return 0;
+    };
+    const check = () => {
+      const last = getLastBackupAt();
+      const due = !last || Date.now() - last >= INTERVAL;
+      if (!due) return;
+      if (githubBackupReminderEnabled && !githubAutoBackupEnabled && !githubReminderShownRef.current) {
+        githubReminderShownRef.current = true;
+        setShowGithubBackupReminder(true);
+      }
+      if (githubAutoBackupEnabled && !githubAutoBackupRunningRef.current) {
+        if (!githubUsername.trim() || !githubRepo.trim() || !githubToken.trim() || !githubFileName.trim()) {
+          showToast("\u81EA\u52A8 GitHub \u5907\u4EFD\u5DF2\u5230\u671F\uFF0C\u4F46 GitHub \u4FE1\u606F\u4E0D\u5B8C\u6574\uFF0C\u8BF7\u5230\u8BBE\u7F6E\u91CC\u8865\u5168\u914D\u7F6E", "error");
+          return;
+        }
+        githubAutoBackupRunningRef.current = true;
+        void performGithubBackup().finally(() => {
+          githubAutoBackupRunningRef.current = false;
+        });
+      }
+    };
+    check();
+    const timer = window.setInterval(check, 60 * 1e3);
+    return () => window.clearInterval(timer);
+  }, [appDataHydrated, githubAutoBackupEnabled, githubBackupReminderEnabled, githubUsername, githubRepo, githubToken, githubFileName, lastGithubBackupTime]);
   const handleExportCurrentSection = () => {
     const config = getCurrentSectionConfig();
     if (!config) return;
@@ -4758,7 +5255,8 @@ ${wb.content || ""}`;
     "chat-memes": "\u804A\u5929\u6897",
     "themes": "\u7F8E\u5316",
     "fonts": "\u5B57\u4F53",
-    "api-storage": "API \u5B58\u50A8"
+    "api-storage": "API \u5B58\u50A8",
+    "settings": "\u8BBE\u7F6E"
   };
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -4806,6 +5304,29 @@ ${wb.content || ""}`;
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 3200);
   };
+  useEffect(() => {
+    const safe = Math.max(44, Math.min(100, Number(topHeaderHeight) || 56));
+    document.documentElement.style.setProperty("--app-header-height", `${safe}px`);
+    localStorage.setItem("toolbox_top_header_height", String(safe));
+  }, [topHeaderHeight]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_file_name", githubFileName);
+  }, [githubFileName]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_repo", githubRepo);
+  }, [githubRepo]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_username", githubUsername);
+  }, [githubUsername]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_token", githubToken);
+  }, [githubToken]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_auto_backup", githubAutoBackupEnabled ? "1" : "0");
+  }, [githubAutoBackupEnabled]);
+  useEffect(() => {
+    localStorage.setItem("toolbox_github_backup_reminder", githubBackupReminderEnabled ? "1" : "0");
+  }, [githubBackupReminderEnabled]);
   const copyTextReliable = async (text, successMessage = "\u5DF2\u590D\u5236\u5230\u526A\u8D34\u677F") => {
     try {
       if (navigator.clipboard && window.isSecureContext) {
@@ -4854,6 +5375,14 @@ ${wb.content || ""}`;
       const file = fileArr[i];
       try {
         const card = await parseCardFile(file);
+        const ext = file.name.toLowerCase().split(".").pop();
+        if ((ext === "png" || ext === "webp") && card.fileType !== "json") {
+          try {
+            await saveCardSourceImage(card.id, file);
+          } catch (imageStoreErr) {
+            console.warn("\u4FDD\u5B58\u89D2\u8272\u5361\u539F\u56FE\u5931\u8D25\uFF0C\u5C06\u7EE7\u7EED\u4F7F\u7528\u7F29\u7565\u56FE", imageStoreErr);
+          }
+        }
         card.group = groupForNewCards;
         pendingBatch.push(card);
         successCount++;
@@ -4882,6 +5411,8 @@ ${wb.content || ""}`;
     if (!confirm("\u786E\u5B9A\u8981\u5220\u9664\u8FD9\u5F20\u89D2\u8272\u5361\u5417\uFF1F")) return;
     const updatedCards = appData.cards.filter((c) => c.id !== id);
     updateAppData({ ...appData, cards: updatedCards });
+    void deleteCardSourceImage(id).catch(() => {
+    });
     if (detailCardId === id) setDetailCardId(null);
     showToast("\u89D2\u8272\u5361\u5DF2\u5220\u9664", "info");
   };
@@ -4893,17 +5424,39 @@ ${wb.content || ""}`;
     ].map((t) => String(t).trim()).filter(Boolean)));
     const worldBook = getCardWorldBook(card);
     const regexScripts = getCardRegex(card) || [];
+    const alternateGreetings = getCardAlternateGreetings(card) || [];
     const target = data?.data && typeof data.data === "object" ? data.data : data;
     if (!target || typeof target !== "object") return data;
     if (tags.length) target.tags = tags;
+    if (alternateGreetings.length) target.alternate_greetings = JSON.parse(JSON.stringify(alternateGreetings));
     if (worldBook && typeof worldBook === "object") {
       target.character_book = JSON.parse(JSON.stringify(worldBook));
     }
+    target.extensions = target.extensions && typeof target.extensions === "object" ? target.extensions : {};
     if (regexScripts.length) {
-      target.extensions = target.extensions && typeof target.extensions === "object" ? target.extensions : {};
       target.extensions.regex_scripts = JSON.parse(JSON.stringify(regexScripts));
     }
     return data;
+  };
+  const getCardCoverList = (card) => {
+    const list = [card.coverImage, ...card.extraCovers || []].filter(Boolean);
+    return Array.from(new Set(list));
+  };
+  const selectCardCover = (card, index) => {
+    const covers = getCardCoverList(card);
+    if (!covers[index]) return;
+    const selected = covers[index];
+    const others = covers.filter((_, i) => i !== index);
+    const updatedCards = appData.cards.map((c) => c.id === card.id ? {
+      ...c,
+      coverImage: selected,
+      extraCovers: others,
+      activeCoverIndex: 0,
+      coverImageUpdatedAt: Date.now(),
+      updatedAt: Date.now()
+    } : c);
+    updateAppData({ ...appData, cards: updatedCards });
+    showToast("\u5DF2\u5207\u6362\u5F53\u524D\u5C01\u9762\u56FE", "success");
   };
   const exportAsJson = (card) => {
     const rawCardData = buildFullCardExportData(card);
@@ -4917,33 +5470,72 @@ ${wb.content || ""}`;
     try {
       const rawCardData = buildFullCardExportData(card);
       const pureData = getPureCardDataForExport(rawCardData);
-      const jsonStr = JSON.stringify(pureData);
-      const b64 = btoa(unescape(encodeURIComponent(jsonStr)));
-      let baseImageUrl = card.coverImage || "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-      const img = new Image();
-      img.crossOrigin = "anonymous";
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = reject;
-        img.src = baseImageUrl;
-      });
-      const canvas = document.createElement("canvas");
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("Canvas context error");
-      ctx.drawImage(img, 0, 0);
-      const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
-      if (!blob) throw new Error("Blob creation failed");
-      const buf = await blob.arrayBuffer();
-      const keyword = card.version === "v3" ? "ccv3" : "chara";
-      const newPngBuf = injectPngTextChunk(buf, keyword, b64);
+      const v3Data = JSON.parse(JSON.stringify(pureData));
+      v3Data.spec = "chara_card_v3";
+      v3Data.spec_version = "3.0";
+      const v3Json = JSON.stringify(v3Data);
+      const v2Data = JSON.parse(JSON.stringify(pureData));
+      v2Data.spec = "chara_card_v2";
+      v2Data.spec_version = "2.0";
+      const v2Json = JSON.stringify(v2Data);
+      const toBase64Utf8 = (value) => {
+        const bytes = new TextEncoder().encode(value);
+        let binary = "";
+        const step = 32768;
+        for (let i = 0; i < bytes.length; i += step) {
+          binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + step, bytes.length)));
+        }
+        return btoa(binary);
+      };
+      const charaB64 = toBase64Utf8(v2Json);
+      const ccv3B64 = toBase64Utf8(v3Json);
+      let pngBytes = null;
+      const coverWasReplaced = Boolean(card.coverImageUpdatedAt);
+      if (!coverWasReplaced) {
+        try {
+          const originalBlob = await getCardSourceImage(card.id);
+          if (originalBlob && originalBlob.type === "image/png") {
+            pngBytes = await originalBlob.arrayBuffer();
+          }
+        } catch {
+        }
+      }
+      if (!pngBytes) {
+        const baseImageUrl = card.coverImage || "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+          img.onload = () => resolve();
+          img.onerror = () => reject(new Error("\u5C01\u9762\u56FE\u7247\u8BFB\u53D6\u5931\u8D25"));
+          img.src = baseImageUrl;
+        });
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) throw new Error("Canvas context error");
+        ctx.drawImage(img, 0, 0);
+        const blob = await new Promise((res) => canvas.toBlob(res, "image/png"));
+        if (!blob) throw new Error("PNG \u56FE\u7247\u751F\u6210\u5931\u8D25");
+        pngBytes = await blob.arrayBuffer();
+      }
+      const newPngBuf = injectTavernCardChunks(pngBytes, charaB64, ccv3B64);
+      if (!(newPngBuf instanceof ArrayBuffer) || newPngBuf.byteLength < 100) {
+        throw new Error("PNG \u5BFC\u51FA\u7ED3\u679C\u4E3A\u7A7A\u6216\u7ED3\u6784\u5F02\u5E38");
+      }
+      const pngCheck = new Uint8Array(newPngBuf, 0, 8);
+      const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+      if (!pngSignature.every((v, i) => pngCheck[i] === v)) {
+        throw new Error("PNG \u5BFC\u51FA\u7ED3\u679C\u65E0\u6548");
+      }
       const pngBlob = new Blob([newPngBuf], { type: "image/png" });
+      if (pngBlob.size !== newPngBuf.byteLength || pngBlob.size <= 0) {
+        throw new Error("PNG \u6587\u4EF6\u5927\u5C0F\u6821\u9A8C\u5931\u8D25");
+      }
       downloadBlobFile(pngBlob, `${getCardDisplayName(card)}.png`);
-      showToast("PNG \u5BFC\u51FA\u6210\u529F\uFF08\u5DF2\u5305\u542B\u6982\u89C8\u3001\u5F00\u573A\u767D\u3001\u4E16\u754C\u4E66\u3001\u6B63\u5219\u4E0E\u6807\u7B7E\uFF09", "success");
+      showToast("PNG \u5BFC\u51FA\u6210\u529F\uFF08\u517C\u5BB9 SillyTavern V2/V3\uFF0C\u5E76\u5305\u542B\u5F53\u524D\u5C01\u9762\uFF09", "success");
     } catch (e) {
       console.error(e);
-      showToast("PNG \u5BFC\u51FA\u5931\u8D25: " + e.message, "error");
+      showToast("PNG \u5BFC\u51FA\u5931\u8D25: " + (e?.message || e), "error");
     }
   };
   const handleUpdateCardOverwrite = async (file) => {
@@ -5064,12 +5656,25 @@ ${wb.content || ""}`;
     }
     return true;
   });
-  const filteredCards = sortItemList(
-    cardSortOrder === "default" ? [...baseFilteredCards].reverse() : baseFilteredCards,
-    cardSortOrder,
-    getCardDisplayName,
-    (c) => c.createdAt || 0
-  );
+  const filteredCards = (() => {
+    try {
+      const source = cardSortOrder === "default" ? [...baseFilteredCards].reverse() : [...baseFilteredCards];
+      return sortItemList(source, cardSortOrder, (c) => {
+        try {
+          return getCardDisplayName(c) || "";
+        } catch {
+          return "";
+        }
+      }, (c) => {
+        const value = c?.createdAt;
+        const n = typeof value === "number" ? value : Number(value);
+        return Number.isFinite(n) ? n : 0;
+      });
+    } catch (err) {
+      console.warn("\u89D2\u8272\u5361\u6392\u5E8F\u5931\u8D25\uFF0C\u56DE\u9000\u539F\u987A\u5E8F", err);
+      return [...baseFilteredCards];
+    }
+  })();
   useEffect(() => {
     setCardVisibleCount(CARD_PAGE_SIZE);
   }, [searchQuery, currentGroup, cardSortOrder]);
@@ -5082,14 +5687,34 @@ ${wb.content || ""}`;
           setCardVisibleCount((prev) => Math.min(prev + CARD_PAGE_SIZE, filteredCards.length));
         }
       },
-      { rootMargin: "600px" }
+      { rootMargin: "200px" }
     );
     observer.observe(el);
     return () => observer.disconnect();
   }, [filteredCards.length]);
   const visibleFilteredCards = filteredCards.slice(0, cardVisibleCount);
   const activeDetailCard = appData.cards.find((c) => c.id === detailCardId);
-  const activeLiveCardData = activeDetailCard ? getCurrentCardData(activeDetailCard) : null;
+  const activeLiveCardData = useMemo(() => activeDetailCard ? getCurrentCardData(activeDetailCard) : null, [activeDetailCard]);
+  const detailWorldBook = useMemo(() => {
+    if (!activeDetailCard || detailTab !== "worldbook") return { entries: [] };
+    try {
+      return getCardWorldBook(activeDetailCard) || { entries: [] };
+    } catch {
+      return { entries: [] };
+    }
+  }, [activeDetailCard, detailTab]);
+  const detailGreetings = useMemo(() => {
+    if (!activeDetailCard || detailTab !== "greetings") return [];
+    try {
+      return getCardAlternateGreetings(activeDetailCard) || [];
+    } catch {
+      return [];
+    }
+  }, [activeDetailCard, detailTab]);
+  useEffect(() => {
+    setGreetingVisibleCount(8);
+    setWorldBookVisibleCount(12);
+  }, [detailCardId, detailTab]);
   const normalizeAssociationName = (value) => {
     let name = (value || "").trim().toLowerCase();
     name = name.split("/")[0].trim();
@@ -5399,7 +6024,120 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
       ] }, item.id)) })
     ] });
   };
-  return /* @__PURE__ */ jsxs("div", { className: "min-h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 flex flex-col font-sans antialiased selection:bg-zinc-800 selection:text-white", children: [
+  const renderSettingsPage = () => {
+    const sectionEntries = Object.entries(SECTION_DATA_CONFIG);
+    return /* @__PURE__ */ jsxs("div", { className: "max-w-4xl mx-auto w-full space-y-4 pb-8", children: [
+      /* @__PURE__ */ jsxs("section", { className: "bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl p-5", children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 mb-4", children: [
+          /* @__PURE__ */ jsx("div", { className: "w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center", children: /* @__PURE__ */ jsx(Sliders, { className: "w-4 h-4" }) }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("h2", { className: "text-sm font-bold", children: "\u754C\u9762\u9AD8\u5EA6" }),
+            /* @__PURE__ */ jsx("p", { className: "text-[11px] text-zinc-400 mt-0.5", children: "\u8C03\u6574\u9876\u90E8\u680F\u4E0A\u4E0B\u9AD8\u5EA6\uFF0C\u6240\u6709\u754C\u9762\u540C\u6B65\u751F\u6548" })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-3", children: [
+          /* @__PURE__ */ jsx("button", { type: "button", onClick: () => setTopHeaderHeight((v) => Math.max(44, v - 1)), className: "w-9 h-9 flex-shrink-0 rounded-xl border border-zinc-200 dark:border-zinc-700 text-lg leading-none", children: "\u2212" }),
+          /* @__PURE__ */ jsx("input", { type: "range", min: "44", max: "100", step: "1", value: topHeaderHeight, onChange: (e) => setTopHeaderHeight(Number(e.target.value)), className: "flex-1 accent-zinc-900 dark:accent-zinc-100", "aria-label": "\u9876\u90E8\u9AD8\u5EA6" }),
+          /* @__PURE__ */ jsx("button", { type: "button", onClick: () => setTopHeaderHeight((v) => Math.min(100, v + 1)), className: "w-9 h-9 flex-shrink-0 rounded-xl border border-zinc-200 dark:border-zinc-700 text-lg leading-none", children: "+" }),
+          /* @__PURE__ */ jsxs("div", { className: "w-16 text-center text-xs font-semibold tabular-nums", children: [
+            topHeaderHeight,
+            "px"
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "flex justify-between text-[10px] text-zinc-400 mt-2 px-12", children: [
+          /* @__PURE__ */ jsx("span", { children: "44px" }),
+          /* @__PURE__ */ jsx("span", { children: "100px" })
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxs("section", { className: "bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl p-5", children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 mb-4", children: [
+          /* @__PURE__ */ jsx("div", { className: "w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center", children: /* @__PURE__ */ jsx(FileText, { className: "w-4 h-4" }) }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("h2", { className: "text-sm font-bold", children: "\u4F5C\u8005\u6709\u8BDD\u8BF4" }),
+            /* @__PURE__ */ jsx("p", { className: "text-[11px] text-zinc-400 mt-0.5", children: "\u4F7F\u7528\u672C\u5DE5\u5177\u524D\u8BF7\u5148\u770B\u8FD9\u91CC" })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "text-sm leading-7 whitespace-pre-line text-zinc-700 dark:text-zinc-300", children: "\u7981\u6B62\u4E8C\u4F20\u6E90\u6587\u4EF6\uFF08\u4E8C\u4F20\uFF1D\u4F60\u5C06\u6587\u4EF6\u53D1\u7ED9\u522B\u4EBA\uFF09\n\u5982\u679C\u6709\u4EBA\u60F3\u7528\u53EF\u4EE5\u7ED9\u6211\u8BF4\uFF0C\u8BA9\u4ED6\u6765\u627E\u6211\n\u5141\u8BB8\u81EA\u7528\u4E8C\u6539\uFF0C\u4E8C\u6539\u516C\u5F00\u5148\u95EE\u6211\n\u4E8C\u6539\u5141\u8BB8\u5206\u4EAB\u7ED9\u4EB2\u53CB \u4EBA\u6570\uFF1C5 \u5982\u679C\u4F60\u6709\u5343\u628A\u6765\u4E2A\u4EB2\u53CB\u90A3\u4F60\u9017\u6211\u5462\n\u8054\u7CFB\u65B9\u5F0F\u5982\u4E0B\u2193\nq2181365685\n\u5C0F\u7EA2\u4E66TJZsjsdbz\n\u90AE\u7BB1wait200608@163.com" }),
+        /* @__PURE__ */ jsxs("div", { className: "mt-5 pt-4 border-t border-zinc-100 dark:border-zinc-800 flex gap-2", children: [
+          /* @__PURE__ */ jsx("a", { href: "https://my.feishu.cn/share/base/form/shrcn33cz9C2DUoTncbfkhgIXtb", target: "_blank", rel: "noopener noreferrer", className: "flex-1 flex items-center justify-center h-10 rounded-xl border border-zinc-200 dark:border-zinc-700 text-xs font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800 transition", children: "bug\u53CD\u9988" }),
+          /* @__PURE__ */ jsx("a", { href: "https://my.feishu.cn/share/base/form/shrcnJZIb7mtik0t5Psb1Trhjtb", target: "_blank", rel: "noopener noreferrer", className: "flex-1 flex items-center justify-center h-10 rounded-xl border border-zinc-200 dark:border-zinc-700 text-xs font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800 transition", children: "\u529F\u80FD\u8BB8\u613F" })
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxs("section", { className: "bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl p-5", children: [
+        /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 mb-4", children: [
+          /* @__PURE__ */ jsx("div", { className: "w-8 h-8 rounded-lg bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center", children: /* @__PURE__ */ jsx(Save, { className: "w-4 h-4" }) }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsx("h2", { className: "text-sm font-bold", children: "\u6570\u636E\u5907\u4EFD" }),
+            /* @__PURE__ */ jsx("p", { className: "text-[11px] text-zinc-400 mt-0.5", children: "\u672C\u5730\u6587\u4EF6\u4E0E GitHub \u4ED3\u5E93\u5747\u4F7F\u7528\u540C\u4E00\u5957\u5907\u4EFD\u683C\u5F0F" })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "rounded-xl border border-zinc-200 dark:border-zinc-800 p-4 space-y-4", children: /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("div", { className: "text-xs font-semibold mb-2", children: "\u672C\u5730\u6587\u4EF6" }),
+          /* @__PURE__ */ jsxs("div", { className: "flex gap-2 flex-wrap", children: [
+            /* @__PURE__ */ jsx("button", { onClick: () => {
+              setSettingsBackupMode("all");
+              setSettingsBackupSelection([]);
+            }, className: `px-3 py-1.5 rounded-lg text-xs border border-[#E4E4E7] ${settingsBackupMode === "all" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : ""}`, children: "\u5168\u90E8\u6570\u636E" }),
+            /* @__PURE__ */ jsx("button", { onClick: () => setSettingsBackupMode("sections"), className: `px-3 py-1.5 rounded-lg text-xs border border-[#E4E4E7] ${settingsBackupMode === "sections" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900" : ""}`, children: "\u9009\u62E9\u677F\u5757" })
+          ] }),
+          settingsBackupMode === "sections" && /* @__PURE__ */ jsx("div", { className: "mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2", children: sectionEntries.map(([id, config]) => /* @__PURE__ */ jsxs("label", { className: `flex items-center gap-2 p-2.5 rounded-lg border text-xs cursor-pointer ${settingsBackupSelection.includes(id) ? "border-zinc-900 dark:border-zinc-100 bg-zinc-50 dark:bg-zinc-800" : "border-zinc-200 dark:border-zinc-800"}`, children: [
+            /* @__PURE__ */ jsx("input", { type: "checkbox", checked: settingsBackupSelection.includes(id), onChange: () => toggleBackupSection(id), className: "accent-current" }),
+            /* @__PURE__ */ jsx("span", { children: config.label })
+          ] }, id)) }),
+          /* @__PURE__ */ jsxs("div", { className: "mt-3 flex gap-2", children: [
+            /* @__PURE__ */ jsxs("button", { onClick: exportSelectedBackup, disabled: isExportingBackup, className: "flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-[#E4E4E7] text-xs font-medium disabled:opacity-50", children: [
+              /* @__PURE__ */ jsx(Download, { className: "w-3.5 h-3.5" }),
+              isExportingBackup ? "\u5BFC\u51FA\u4E2D\u2026" : "\u5BFC\u51FA"
+            ] }),
+            /* @__PURE__ */ jsxs("button", { onClick: () => importBackupInputRef.current?.click(), disabled: isImportingBackup, className: "flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-[#E4E4E7] text-xs font-medium disabled:opacity-50", children: [
+              /* @__PURE__ */ jsx(Upload, { className: "w-3.5 h-3.5" }),
+              isImportingBackup ? "\u5BFC\u5165\u4E2D\u2026" : "\u5BFC\u5165\u5E76\u8986\u76D6"
+            ] })
+          ] }),
+          /* @__PURE__ */ jsx("p", { className: "text-[10px] text-zinc-400 mt-2", children: "\u9009\u62E9\u201C\u5168\u90E8\u6570\u636E\u201D\u4F1A\u8986\u76D6\u5907\u4EFD\u6587\u4EF6\u4E2D\u7684\u5168\u90E8\u975E\u5B57\u4F53\u677F\u5757\uFF1B\u9009\u62E9\u677F\u5757\u540E\u53EA\u8986\u76D6\u52FE\u9009\u7684\u677F\u5757\u3002" })
+        ] }) }),
+        /* @__PURE__ */ jsxs("div", { className: "mt-4 rounded-xl border border-zinc-200 dark:border-zinc-800 p-4 space-y-3", children: [
+          /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2", children: [
+            /* @__PURE__ */ jsx(Github, { className: "w-4 h-4" }),
+            /* @__PURE__ */ jsx("div", { className: "text-xs font-semibold", children: "GitHub \u4ED3\u5E93\u5907\u4EFD" })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-1 sm:grid-cols-2 gap-2", children: [
+            /* @__PURE__ */ jsx("input", { value: githubFileName, onChange: (e) => setGithubFileName(e.target.value), placeholder: "\u6587\u4EF6\u540D\uFF0C\u4F8B\u5982 toolbox-backup", className: "px-3 py-2 rounded-lg border border-[#E4E4E7] bg-transparent text-xs focus:outline-none" }),
+            /* @__PURE__ */ jsx("input", { value: githubRepo, onChange: (e) => setGithubRepo(e.target.value), placeholder: "\u4ED3\u5E93\u540D\uFF0C\u4F8B\u5982 toolbox-backup\uFF08\u4E5F\u53EF\u586B owner/repo\uFF09", className: "px-3 py-2 rounded-lg border border-[#E4E4E7] bg-transparent text-xs focus:outline-none" }),
+            /* @__PURE__ */ jsx("input", { value: githubUsername, onChange: (e) => setGithubUsername(e.target.value), placeholder: "GitHub \u7528\u6237\u540D", className: "px-3 py-2 rounded-lg border border-[#E4E4E7] bg-transparent text-xs focus:outline-none" }),
+            /* @__PURE__ */ jsx("input", { type: "password", value: githubToken, onChange: (e) => setGithubToken(e.target.value), placeholder: "GitHub Token", className: "px-3 py-2 rounded-lg border border-[#E4E4E7] bg-transparent text-xs focus:outline-none", autoComplete: "off" })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "border-t border-zinc-100 dark:border-zinc-800 pt-3 space-y-2.5", children: [
+            /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-3", children: [
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { className: "text-xs font-medium", children: "\u5B9A\u671F\u81EA\u52A8\u5907\u4EFD" }),
+                /* @__PURE__ */ jsx("div", { className: "text-[10px] text-zinc-400 mt-0.5", children: "\u6BCF 2 \u5929\u68C0\u67E5\u4E00\u6B21\uFF0C\u5230\u671F\u540E\u81EA\u52A8\u5907\u4EFD\uFF1B\u9ED8\u8BA4\u5173\u95ED" })
+              ] }),
+              /* @__PURE__ */ jsx("button", { type: "button", role: "switch", "aria-checked": githubAutoBackupEnabled, onClick: () => setGithubAutoBackupEnabled((v) => !v), className: `relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${githubAutoBackupEnabled ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-200 dark:bg-zinc-700"}`, children: /* @__PURE__ */ jsx("span", { className: `absolute top-1 w-4 h-4 rounded-full bg-white dark:bg-zinc-900 transition-transform ${githubAutoBackupEnabled ? "translate-x-6" : "translate-x-1"}` }) })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-3", children: [
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { className: "text-xs font-medium", children: "\u5907\u4EFD\u63D0\u9192" }),
+                /* @__PURE__ */ jsx("div", { className: "text-[10px] text-zinc-400 mt-0.5", children: "\u8D85\u8FC7 2 \u5929\u672A\u5907\u4EFD\u65F6\u5F39\u7A97\u63D0\u9192\uFF1B\u9ED8\u8BA4\u5173\u95ED" })
+              ] }),
+              /* @__PURE__ */ jsx("button", { type: "button", role: "switch", "aria-checked": githubBackupReminderEnabled, onClick: () => setGithubBackupReminderEnabled((v) => !v), className: `relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${githubBackupReminderEnabled ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-200 dark:bg-zinc-700"}`, children: /* @__PURE__ */ jsx("span", { className: `absolute top-1 w-4 h-4 rounded-full bg-white dark:bg-zinc-900 transition-transform ${githubBackupReminderEnabled ? "translate-x-6" : "translate-x-1"}` }) })
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxs("button", { onClick: performGithubBackup, disabled: isGithubBackingUp, className: "w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg border border-[#E4E4E7] text-xs font-medium disabled:opacity-50", children: [
+            /* @__PURE__ */ jsx(Github, { className: "w-3.5 h-3.5" }),
+            isGithubBackingUp ? "\u6B63\u5728\u5907\u4EFD\u2026" : "\u5907\u4EFD\u5230 GitHub"
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1.5 text-[10px] text-zinc-400", children: [
+            /* @__PURE__ */ jsx(Clock, { className: "w-3 h-3" }),
+            "\u4E0A\u6B21 GitHub \u5907\u4EFD\uFF1A",
+            lastGithubBackupTime || "\u6682\u65E0"
+          ] }),
+          /* @__PURE__ */ jsx("p", { className: "text-[10px] text-zinc-400 leading-5", children: "GitHub \u914D\u7F6E\u4EC5\u4FDD\u5B58\u5728\u672C\u673A\uFF0C\u7528\u4E8E\u5B9A\u671F\u81EA\u52A8\u5907\u4EFD\uFF1BToken \u4E0D\u4F1A\u5199\u5165 Toolbox \u6570\u636E\u5907\u4EFD\u6587\u4EF6\u3002" })
+        ] })
+      ] })
+    ] });
+  };
+  return /* @__PURE__ */ jsxs("div", { className: "min-h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 flex flex-col font-sans antialiased selection:bg-zinc-800 selection:text-white", style: { "--app-header-height": `${topHeaderHeight}px` }, children: [
     !appDataHydrated && /* @__PURE__ */ jsx("div", { className: "fixed inset-0 z-[200] flex items-center justify-center bg-zinc-50/95 dark:bg-zinc-950/95 backdrop-blur-sm", children: /* @__PURE__ */ jsxs("div", { className: "flex flex-col items-center gap-3 text-zinc-500 dark:text-zinc-400", children: [
       /* @__PURE__ */ jsx(RefreshCw, { className: "w-5 h-5 animate-spin" }),
       /* @__PURE__ */ jsx("span", { className: "text-sm", children: "\u6B63\u5728\u52A0\u8F7D\u672C\u5730\u6570\u636E\u2026" })
@@ -5477,34 +6215,20 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 )) })
               ] })
             ] }),
-            /* @__PURE__ */ jsxs("div", { className: "p-3 border-t border-zinc-200 dark:border-zinc-800 space-y-2 flex-shrink-0", children: [
-              /* @__PURE__ */ jsxs(
-                "button",
-                {
-                  onClick: () => importBackupInputRef.current?.click(),
-                  disabled: isImportingBackup,
-                  className: "w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                  children: [
-                    /* @__PURE__ */ jsx(Upload, { className: "w-3.5 h-3.5" }),
-                    " ",
-                    isImportingBackup ? "\u6B63\u5728\u5BFC\u5165\u2026" : "\u5BFC\u5165\u5168\u90E8\u6570\u636E\uFF08\u4E0D\u542B\u5B57\u4F53\uFF09"
-                  ]
-                }
-              ),
-              /* @__PURE__ */ jsxs(
-                "button",
-                {
-                  onClick: handleExportFullBackup,
-                  disabled: isExportingBackup,
-                  className: "w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
-                  children: [
-                    /* @__PURE__ */ jsx(Download, { className: "w-3.5 h-3.5" }),
-                    " ",
-                    isExportingBackup ? "\u6B63\u5728\u5BFC\u51FA\u2026" : "\u5BFC\u51FA\u5168\u90E8\u6570\u636E\uFF08\u4E0D\u542B\u5B57\u4F53\uFF09"
-                  ]
-                }
-              )
-            ] })
+            /* @__PURE__ */ jsx("div", { className: "p-3 border-t border-zinc-200 dark:border-zinc-800 flex-shrink-0", children: /* @__PURE__ */ jsxs(
+              "button",
+              {
+                onClick: () => {
+                  setCurrentPage("settings");
+                  setSidebarOpen(false);
+                },
+                className: `w-full flex items-center justify-center gap-2 px-3 py-2.5 text-xs font-medium rounded-lg border transition-colors ${currentPage === "settings" ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 border-zinc-900 dark:border-zinc-100" : "border-zinc-200 dark:border-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300"}`,
+                children: [
+                  /* @__PURE__ */ jsx(Settings, { className: "w-3.5 h-3.5" }),
+                  " \u8BBE\u7F6E"
+                ]
+              }
+            ) })
           ]
         }
       ),
@@ -5520,30 +6244,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 children: /* @__PURE__ */ jsx(Menu, { className: "w-5 h-5" })
               }
             ),
-            /* @__PURE__ */ jsx("span", { className: "font-bold text-base tracking-tight text-zinc-900 dark:text-zinc-100 cursor-pointer", onClick: () => setSidebarOpen((p) => !p), children: PAGE_NAMES[currentPage] || "ST \u89D2\u8272\u5361" }),
-            /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1.5 ml-0.5", children: [
-              /* @__PURE__ */ jsx(
-                "button",
-                {
-                  type: "button",
-                  onClick: triggerImportCurrentSection,
-                  disabled: isImportingSection,
-                  className: "h-7 px-2.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-[12px] font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors disabled:opacity-50",
-                  title: "\u5BFC\u5165\u5F53\u524D\u677F\u5757\u5168\u90E8\u6570\u636E",
-                  children: isImportingSection ? "\u5BFC\u5165\u4E2D\u2026" : "\u5BFC\u5165"
-                }
-              ),
-              /* @__PURE__ */ jsx(
-                "button",
-                {
-                  type: "button",
-                  onClick: handleExportCurrentSection,
-                  className: "h-7 px-2.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-[12px] font-medium text-zinc-700 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors",
-                  title: "\u5BFC\u51FA\u5F53\u524D\u677F\u5757\u5168\u90E8\u6570\u636E",
-                  children: "\u5BFC\u51FA"
-                }
-              )
-            ] })
+            /* @__PURE__ */ jsx("span", { className: "font-bold text-base tracking-tight text-zinc-900 dark:text-zinc-100 cursor-pointer", onClick: () => setSidebarOpen((p) => !p), children: PAGE_NAMES[currentPage] || "ST \u89D2\u8272\u5361" })
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2", children: [
             currentPage === "st-themes" && /* @__PURE__ */ jsxs(Fragment, { children: [
@@ -5712,7 +6413,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             )
           ] })
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto p-4 md:p-6", children: currentPage === "st-cards" ? /* @__PURE__ */ jsxs("div", { className: "max-w-7xl mx-auto space-y-5", children: [
+        /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto p-4 md:p-6", children: currentPage === "settings" ? renderSettingsPage() : currentPage === "st-cards" ? /* @__PURE__ */ jsxs("div", { className: "max-w-7xl mx-auto space-y-5", children: [
           /* @__PURE__ */ jsxs(
             "div",
             {
@@ -5881,7 +6582,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
               ] })
             ] })
           ] }),
-          filteredCards.length === 0 ? /* @__PURE__ */ jsx("div", { className: "text-center py-20 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-8", children: /* @__PURE__ */ jsx("p", { className: "text-sm text-zinc-400 dark:text-zinc-500", children: searchQuery ? "\u672A\u67E5\u627E\u5230\u5339\u914D\u7684\u89D2\u8272\u5361" : "\u8BE5\u5206\u7EC4\u4E0B\u6682\u65E0\u89D2\u8272\u5361\uFF0C\u62D6\u653E\u6587\u4EF6\u5230\u4E0A\u65B9\u6846\u5185\u8FDB\u884C\u4E0A\u4F20" }) }) : /* @__PURE__ */ jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2.5", children: visibleFilteredCards.map((card) => {
+          filteredCards.length === 0 ? /* @__PURE__ */ jsx("div", { className: "text-center py-20 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-8", children: /* @__PURE__ */ jsx("p", { className: "text-sm text-zinc-400 dark:text-zinc-500", children: searchQuery ? "\u672A\u67E5\u627E\u5230\u5339\u914D\u7684\u89D2\u8272\u5361" : "\u8BE5\u5206\u7EC4\u4E0B\u6682\u65E0\u89D2\u8272\u5361\uFF0C\u62D6\u653E\u6587\u4EF6\u5230\u4E0A\u65B9\u6846\u5185\u8FDB\u884C\u4E0A\u4F20" }) }) : /* @__PURE__ */ jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2.5", style: { contentVisibility: "auto" }, children: visibleFilteredCards.map((card) => {
             const name = getCardDisplayName(card);
             const author = getCardCreator(card);
             const tags = Array.from(/* @__PURE__ */ new Set([...getCardTags(card), ...card.tags || []])).slice(0, 6);
@@ -5900,8 +6601,8 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 },
                 className: `group bg-white dark:bg-zinc-900 border rounded-lg overflow-hidden cursor-pointer transition-all hover:shadow-md flex flex-col relative ${isSelected ? "border-zinc-900 dark:border-zinc-100 ring-2 ring-zinc-900 dark:ring-zinc-100" : "border-zinc-200 dark:border-zinc-800 hover:border-zinc-400 dark:hover:border-zinc-600"}`,
                 children: [
-                  /* @__PURE__ */ jsxs("div", { className: "aspect-[2/3] w-full bg-zinc-100 dark:bg-zinc-800 relative overflow-hidden flex items-center justify-center", children: [
-                    card.coverImage ? /* @__PURE__ */ jsx("img", { src: card.coverImage, alt: name, className: "w-full h-full object-contain group-hover:scale-105 transition-transform duration-300" }) : /* @__PURE__ */ jsxs("div", { className: "text-[10px] text-zinc-400 flex flex-col items-center gap-0.5", children: [
+                  /* @__PURE__ */ jsxs("div", { className: "aspect-[2/3] w-full bg-white relative overflow-hidden flex items-center justify-center", children: [
+                    card.coverImage ? /* @__PURE__ */ jsx("img", { src: card.coverImage, alt: name, className: "w-full h-full object-contain group-hover:scale-105 transition-transform duration-300", loading: "lazy", decoding: "async", fetchPriority: "low" }) : /* @__PURE__ */ jsxs("div", { className: "text-[10px] text-zinc-400 flex flex-col items-center gap-0.5", children: [
                       /* @__PURE__ */ jsx(ImageIcon, { className: "w-5 h-5 opacity-40" }),
                       /* @__PURE__ */ jsx("span", { children: "\u65E0\u5C01\u9762" })
                     ] }),
@@ -5917,7 +6618,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                       ] })
                     ] }),
                     /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1 min-w-0", children: [
-                      /* @__PURE__ */ jsx("div", { className: "flex items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap", children: tags.map((t, idx) => /* @__PURE__ */ jsx("span", { className: "shrink-0 px-1 py-0.5 text-[8px] bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded leading-none", children: t }, idx)) }),
+                      /* @__PURE__ */ jsx("div", { className: "flex items-center gap-1 min-w-0 overflow-hidden whitespace-nowrap", children: tags.map((t, idx) => /* @__PURE__ */ jsx("span", { className: "shrink-0 max-w-[7rem] px-1 py-0.5 text-[8px] bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded leading-none truncate whitespace-nowrap", children: t }, idx)) }),
                       /* @__PURE__ */ jsx("span", { className: "shrink-0 px-1.5 py-0.5 text-[9px] bg-zinc-200/60 dark:bg-zinc-800 text-zinc-500 rounded ml-auto", children: card.group || "\u9ED8\u8BA4" })
                     ] })
                   ] }),
@@ -8104,7 +8805,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 ]
               }
             )
-          ] }) : /* @__PURE__ */ jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2.5", children: filteredStickerPacks.map((pack) => {
+          ] }) : /* @__PURE__ */ jsx("div", { className: "grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2.5", style: { contentVisibility: "auto" }, children: filteredStickerPacks.map((pack) => {
             const isSelected = selectedStickerPackIds.includes(pack.id);
             const firstSticker = pack.items[0];
             return /* @__PURE__ */ jsxs(
@@ -8475,33 +9176,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
           const file = e.target.files?.[0];
           e.target.value = "";
           if (!file) return;
-          setIsImportingBackup(true);
-          showToast("\u6B63\u5728\u8BFB\u53D6\u5907\u4EFD\u6587\u4EF6\uFF0C\u6570\u636E\u91CF\u8F83\u5927\u65F6\u8BF7\u7A0D\u5019\u2026", "info");
-          const reader = new FileReader();
-          reader.onload = () => {
-            setTimeout(() => {
-              try {
-                const data = JSON.parse(reader.result);
-                if (data && typeof data === "object" && Array.isArray(data.cards) && Array.isArray(data.groups)) {
-                  const { fonts: _fonts, fontCategories: _fontCategories, ...backupData } = data;
-                  updateAppData((prev) => ({ ...prev, ...backupData }));
-                  showToast("\u5168\u90E8\u6570\u636E\u5BFC\u5165\u6210\u529F\uFF01\u5DF2\u6062\u590D\u9664\u5B57\u4F53\u5916\u7684\u5168\u90E8\u677F\u5757\u6570\u636E", "success");
-                } else {
-                  showToast("\u5907\u4EFD\u6587\u4EF6\u683C\u5F0F\u4E0D\u7B26\u5408\u8981\u6C42", "error");
-                }
-              } catch (err) {
-                console.error("Import full backup failed", err);
-                showToast("\u5BFC\u5165\u5931\u8D25\uFF1A\u6587\u4EF6\u53EF\u80FD\u5DF2\u635F\u574F\u6216\u6570\u636E\u91CF\u8FC7\u5927\uFF08" + (err?.message || String(err)) + "\uFF09", "error");
-              } finally {
-                setIsImportingBackup(false);
-              }
-            }, 20);
-          };
-          reader.onerror = () => {
-            showToast("\u5BFC\u5165\u5931\u8D25\uFF1A\u6587\u4EF6\u8BFB\u53D6\u51FA\u9519", "error");
-            setIsImportingBackup(false);
-          };
-          reader.readAsText(file);
+          void handleSettingsBackupImport(file);
         }
       }
     ),
@@ -8565,40 +9240,77 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
         },
         tab.id
       )) }),
-      /* @__PURE__ */ jsxs("div", { className: "flex-1 overflow-y-auto p-6 space-y-6", children: [
+      /* @__PURE__ */ jsx(CardDetailTabErrorBoundary, { tabKey: detailTab, children: /* @__PURE__ */ jsxs("div", { className: "flex-1 min-h-0 overflow-y-auto p-6 space-y-6", children: [
         detailTab === "overview" && /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-1 md:grid-cols-12 gap-6", children: [
           /* @__PURE__ */ jsx("div", { className: "md:col-span-8 space-y-4" }),
           /* @__PURE__ */ jsxs("div", { className: "md:col-span-4 space-y-4", children: [
             /* @__PURE__ */ jsx("div", { className: "aspect-[2/3] w-full rounded-xl overflow-hidden bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-800 relative flex items-center justify-center", children: activeDetailCard.coverImage ? /* @__PURE__ */ jsx("img", { src: activeDetailCard.coverImage, alt: "Cover", className: "w-full h-full object-contain" }) : /* @__PURE__ */ jsx("span", { className: "text-xs text-zinc-400", children: "\u65E0\u5C01\u9762" }) }),
-            /* @__PURE__ */ jsx(
-              "button",
-              {
-                onClick: () => coverUploadInputRef.current?.click(),
-                className: "w-full py-2 text-xs font-medium rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 text-zinc-600 dark:text-zinc-400 transition-colors",
-                children: "\u70B9\u51FB\u66FF\u6362/\u66F4\u65B0\u5C01\u9762\u56FE"
-              }
-            ),
-            /* @__PURE__ */ jsx(
-              "input",
-              {
-                type: "file",
-                ref: coverUploadInputRef,
-                accept: "image/*",
-                className: "hidden",
-                onChange: async (e) => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    const original = await fileToDataURL(file);
-                    const updatedCards = appData.cards.map(
-                      (c) => c.id === activeDetailCard.id ? { ...c, coverImage: original } : c
-                    );
-                    updateAppData({ ...appData, cards: updatedCards });
-                    showToast("\u5C01\u9762\u66F4\u65B0\u6210\u529F", "success");
-                  }
-                  e.target.value = "";
+            /* @__PURE__ */ jsxs("div", { className: "space-y-2", children: [
+              /* @__PURE__ */ jsx(
+                "button",
+                {
+                  onClick: () => coverUploadInputRef.current?.click(),
+                  className: "w-full py-2 text-xs font-medium rounded-lg border border-dashed border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 text-zinc-600 dark:text-zinc-400 transition-colors",
+                  children: "\u4E0A\u4F20\u5C01\u9762\u56FE\uFF08\u53EF\u591A\u9009\uFF09"
                 }
-              }
-            ),
+              ),
+              /* @__PURE__ */ jsx(
+                "input",
+                {
+                  type: "file",
+                  ref: coverUploadInputRef,
+                  accept: "image/*",
+                  multiple: true,
+                  className: "hidden",
+                  onChange: async (e) => {
+                    const files = Array.from(e.target.files || []);
+                    if (!files.length) {
+                      e.target.value = "";
+                      return;
+                    }
+                    try {
+                      const newCovers = [];
+                      for (const file of files) {
+                        newCovers.push(await processImageFile(file, 1200, 1600));
+                      }
+                      const current = getCardCoverList(activeDetailCard);
+                      const merged = Array.from(new Set([...current, ...newCovers].filter(Boolean)));
+                      const updatedCards = appData.cards.map(
+                        (c) => c.id === activeDetailCard.id ? {
+                          ...c,
+                          coverImage: c.coverImage || merged[0] || null,
+                          extraCovers: merged.filter((img) => img !== (c.coverImage || merged[0])),
+                          activeCoverIndex: 0,
+                          coverImageUpdatedAt: Date.now(),
+                          updatedAt: Date.now()
+                        } : c
+                      );
+                      updateAppData({ ...appData, cards: updatedCards });
+                      showToast(`\u5DF2\u6DFB\u52A0 ${newCovers.length} \u5F20\u5C01\u9762\u56FE\uFF0C\u53EF\u70B9\u51FB\u7F29\u7565\u56FE\u5207\u6362`, "success");
+                    } catch (err) {
+                      console.error("\u6DFB\u52A0\u591A\u5C01\u9762\u5931\u8D25", err);
+                      showToast("\u90E8\u5206\u5C01\u9762\u8BFB\u53D6\u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5", "error");
+                    }
+                    e.target.value = "";
+                  }
+                }
+              ),
+              getCardCoverList(activeDetailCard).length > 0 && /* @__PURE__ */ jsx("div", { className: "grid grid-cols-5 gap-1.5", children: getCardCoverList(activeDetailCard).map((cover, index) => /* @__PURE__ */ jsxs(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => selectCardCover(activeDetailCard, index),
+                  className: `relative aspect-[2/3] overflow-hidden rounded-lg border-2 bg-white ${index === 0 ? "border-zinc-900 dark:border-zinc-100" : "border-zinc-200 dark:border-zinc-700"}`,
+                  title: index === 0 ? "\u5F53\u524D\u5C01\u9762" : `\u5207\u6362\u5230\u5C01\u9762 ${index + 1}`,
+                  children: [
+                    /* @__PURE__ */ jsx("img", { src: cover, alt: `\u5C01\u9762 ${index + 1}`, className: "w-full h-full object-contain" }),
+                    index === 0 && /* @__PURE__ */ jsx("span", { className: "absolute left-1 bottom-1 px-1 py-0.5 text-[9px] rounded bg-zinc-900 text-white", children: "\u5F53\u524D" })
+                  ]
+                },
+                `${index}-${cover.slice(-24)}`
+              )) }),
+              /* @__PURE__ */ jsx("p", { className: "text-[10px] text-zinc-400", children: "\u5F53\u524D\u5C01\u9762\u7528\u4E8E\u5355\u72EC\u5BFC\u51FA PNG\uFF1B\u5176\u4ED6\u672A\u9009\u4E2D\u7684\u5C01\u9762\u4E0D\u4F1A\u5199\u5165 PNG \u89D2\u8272\u5361\u6570\u636E\u3002" })
+            ] }),
             /* @__PURE__ */ jsxs("div", { className: "space-y-2 pt-2 border-t border-zinc-200 dark:border-zinc-800", children: [
               /* @__PURE__ */ jsx("div", { className: "text-xs font-bold text-zinc-500 uppercase tracking-wider", children: "\u5BFC\u51FA\u4E0E\u8986\u76D6\u66F4\u65B0" }),
               /* @__PURE__ */ jsxs("div", { className: "grid grid-cols-2 gap-2", children: [
@@ -8781,7 +9493,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 "\u4E3B\u5F00\u573A\u767D (\u652F\u6301\u7F16\u8F91)",
                 /* @__PURE__ */ jsxs("span", { className: "text-[10px] font-normal text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded", children: [
                   "\u4F30\u7B97 ~",
-                  estimateTokens(getCardGreeting(activeDetailCard)),
+                  estimateTokens(String(getCardGreeting(activeDetailCard) || "")),
                   " tokens"
                 ] })
               ] }) }),
@@ -8792,7 +9504,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                     type: "button",
                     onClick: () => downloadJsonFile(`${getCardDisplayName(activeDetailCard)}_st\u5F00\u573A\u767D.json`, {
                       first_mes: getCardGreeting(activeDetailCard),
-                      alternate_greetings: getCardAlternateGreetings(activeDetailCard)
+                      alternate_greetings: detailGreetings
                     }),
                     className: "px-2.5 py-1 text-xs font-medium rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1",
                     children: [
@@ -8837,13 +9549,13 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             /* @__PURE__ */ jsxs("div", { className: "space-y-2", children: [
               /* @__PURE__ */ jsxs("div", { className: "text-xs font-bold text-zinc-800 dark:text-zinc-200", children: [
                 "\u5907\u7528\u5F00\u573A\u767D (",
-                getCardAlternateGreetings(activeDetailCard).length,
+                detailGreetings.length,
                 ")"
               ] }),
               /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-start gap-2", children: [
                 /* @__PURE__ */ jsxs("span", { className: "text-[10px] font-normal text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1.5 py-1 rounded", children: [
                   "\u603B\u8BA1 ~",
-                  getCardAlternateGreetings(activeDetailCard).reduce((sum, g) => sum + estimateTokens(g), 0),
+                  detailGreetings.reduce((sum, g) => sum + estimateTokens(String(g || "")), 0),
                   " tokens"
                 ] }),
                 /* @__PURE__ */ jsxs(
@@ -8862,14 +9574,14 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 )
               ] })
             ] }),
-            getCardAlternateGreetings(activeDetailCard).length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-xs text-zinc-400 italic py-2", children: "\u6682\u65E0\u5907\u7528\u5F00\u573A\u767D" }) : getCardAlternateGreetings(activeDetailCard).map((altGreeting, idx) => /* @__PURE__ */ jsxs("div", { className: "p-3 bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700/60 rounded-xl space-y-2", children: [
+            detailGreetings.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-xs text-zinc-400 italic py-2", children: "\u6682\u65E0\u5907\u7528\u5F00\u573A\u767D" }) : detailGreetings.slice(0, greetingVisibleCount).map((altGreeting, idx) => /* @__PURE__ */ jsxs("div", { className: "p-3 bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700/60 rounded-xl space-y-2", children: [
               /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between", children: [
                 /* @__PURE__ */ jsxs("span", { className: "text-xs font-bold text-zinc-500 flex items-center gap-1.5", children: [
                   "\u5907\u7528 #",
                   idx + 1,
                   /* @__PURE__ */ jsxs("span", { className: "text-[10px] font-normal text-zinc-400", children: [
                     "(~",
-                    estimateTokens(altGreeting),
+                    estimateTokens(String(altGreeting || "")),
                     " tokens)"
                   ] })
                 ] }),
@@ -8893,7 +9605,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                     "button",
                     {
                       onClick: () => {
-                        const currentAlts = getCardAlternateGreetings(activeDetailCard);
+                        const currentAlts = detailGreetings;
                         const updatedAlts = currentAlts.filter((_, i) => i !== idx);
                         const updatedCards = appData.cards.map(
                           (c) => c.id === activeDetailCard.id ? { ...c, editHistory: { ...c.editHistory, alternate_greetings: updatedAlts }, edited: true } : c
@@ -8914,7 +9626,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                   defaultValue: applyCustomGreetingUsername(altGreeting),
                   onBlur: (e) => {
                     const val = restoreCustomGreetingUsername(e.target.value);
-                    const currentAlts = [...getCardAlternateGreetings(activeDetailCard)];
+                    const currentAlts = [...detailGreetings];
                     currentAlts[idx] = val;
                     const updatedCards = appData.cards.map(
                       (c) => c.id === activeDetailCard.id ? { ...c, editHistory: { ...c.editHistory, alternate_greetings: currentAlts }, edited: true } : c
@@ -8927,11 +9639,24 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 },
                 `alt-greeting-${activeDetailCard.id}-${idx}-${customGreetingUsername}`
               )
-            ] }, idx))
+            ] }, idx)),
+            detailGreetings.length > greetingVisibleCount && /* @__PURE__ */ jsxs(
+              "button",
+              {
+                type: "button",
+                onClick: () => setGreetingVisibleCount((n) => Math.min(n + 8, detailGreetings.length)),
+                className: "w-full py-2 text-xs font-medium rounded-xl border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800",
+                children: [
+                  "\u52A0\u8F7D\u66F4\u591A\u5F00\u573A\u767D\uFF08\u8FD8\u5269 ",
+                  detailGreetings.length - greetingVisibleCount,
+                  " \u6761\uFF09"
+                ]
+              }
+            )
           ] })
         ] }),
         detailTab === "worldbook" && (() => {
-          const currentWb = getCardWorldBook(activeDetailCard) || { entries: [] };
+          const currentWb = detailWorldBook || { entries: [] };
           const entries = currentWb.entries || [];
           const totalWbTokens = entries.reduce(
             (sum, entry) => sum + estimateTokens(entry.content || "") + estimateTokens(Array.isArray(entry.keys) ? entry.keys.join(", ") : entry.keys || ""),
@@ -9014,9 +9739,9 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 )
               ] })
             ] }),
-            entries.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-xs text-zinc-400 italic py-4 text-center", children: "\u6B64\u89D2\u8272\u5361\u6682\u65E0\u4E16\u754C\u4E66\u6761\u76EE" }) : /* @__PURE__ */ jsx("div", { className: "space-y-3", children: entries.map((entry, i) => {
+            entries.length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-xs text-zinc-400 italic py-4 text-center", children: "\u6B64\u89D2\u8272\u5361\u6682\u65E0\u4E16\u754C\u4E66\u6761\u76EE" }) : /* @__PURE__ */ jsx("div", { className: "space-y-3", children: entries.slice(0, worldBookVisibleCount).map((entry, i) => {
               const entryTokens = estimateTokens(entry.content || "") + estimateTokens(Array.isArray(entry.keys) ? entry.keys.join(", ") : entry.keys || "");
-              return /* @__PURE__ */ jsxs("div", { className: "p-3.5 bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700/60 rounded-xl space-y-2.5", children: [
+              return /* @__PURE__ */ jsxs("div", { className: "p-3.5 bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700/60 rounded-xl space-y-2.5 [content-visibility:auto] [contain-intrinsic-size:280px]", children: [
                 /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-2", children: [
                   /* @__PURE__ */ jsx(
                     "input",
@@ -9119,7 +9844,20 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                   )
                 ] })
               ] }, i);
-            }) })
+            }) }),
+            entries.length > worldBookVisibleCount && /* @__PURE__ */ jsxs(
+              "button",
+              {
+                type: "button",
+                onClick: () => setWorldBookVisibleCount((n) => Math.min(n + 12, entries.length)),
+                className: "w-full py-2 text-xs font-medium rounded-xl border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800",
+                children: [
+                  "\u52A0\u8F7D\u66F4\u591A\u4E16\u754C\u4E66\u6761\u76EE\uFF08\u8FD8\u5269 ",
+                  entries.length - worldBookVisibleCount,
+                  " \u6761\uFF09"
+                ]
+              }
+            )
           ] });
         })(),
         detailTab === "regex" && /* @__PURE__ */ jsxs("div", { className: "space-y-4", children: [
@@ -9287,6 +10025,10 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
           /* @__PURE__ */ jsx("pre", { className: "p-4 bg-zinc-900 text-zinc-100 text-xs font-mono rounded-lg overflow-x-auto max-h-96", children: JSON.stringify(activeLiveCardData, null, 2) })
         ] }),
         detailTab === "extras" && /* @__PURE__ */ jsxs("div", { className: "space-y-6", children: [
+          /* @__PURE__ */ jsxs("div", { className: "p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-800", children: [
+            /* @__PURE__ */ jsx("div", { className: "text-xs font-bold text-zinc-800 dark:text-zinc-200", children: "\u5BFC\u5165\u65F6\u95F4" }),
+            /* @__PURE__ */ jsx("div", { className: "text-xs text-zinc-500 dark:text-zinc-400 mt-1", children: activeDetailCard.createdAt ? new Date(activeDetailCard.createdAt).toLocaleString("zh-CN", { hour12: false }) : "\u672A\u77E5" })
+          ] }),
           /* @__PURE__ */ jsxs("div", { className: "p-4 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700/60 rounded-xl space-y-1.5", children: [
             /* @__PURE__ */ jsx("label", { className: "block text-xs font-bold text-zinc-800 dark:text-zinc-200", children: "\u6765\u6E90 / \u51FA\u5904\uFF08QQ\u53F7/\u7FA4\u3001Discord\u3001\u793E\u533A\u94FE\u63A5\u7B49\uFF0C\u9009\u586B\uFF09" }),
             /* @__PURE__ */ jsx(
@@ -9366,6 +10108,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                             ...c,
                             screenshots: {
                               authorsNote: updatedNotes,
+                              authorsNoteDescription: c.screenshots?.authorsNoteDescription || "",
                               favoriteScenes: c.screenshots?.favoriteScenes || []
                             }
                           } : c
@@ -9410,6 +10153,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                       ...c,
                       screenshots: {
                         authorsNote: [...existing, ...newScreenshots],
+                        authorsNoteDescription: c.screenshots?.authorsNoteDescription || "",
                         favoriteScenes: c.screenshots?.favoriteScenes || []
                       }
                     } : c
@@ -9443,7 +10187,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                           e.stopPropagation();
                           const updatedNotes = activeDetailCard.screenshots.authorsNote.filter((_, i) => i !== idx);
                           const updatedCards = appData.cards.map(
-                            (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { ...c.screenshots, authorsNote: updatedNotes, favoriteScenes: c.screenshots?.favoriteScenes || [] } } : c
+                            (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { ...c.screenshots, authorsNote: updatedNotes, authorsNoteDescription: c.screenshots?.authorsNoteDescription || "", favoriteScenes: c.screenshots?.favoriteScenes || [] } } : c
                           );
                           updateAppData({ ...appData, cards: updatedCards });
                           showToast("\u7167\u7247\u5DF2\u5220\u9664", "info");
@@ -9459,6 +10203,46 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                 idx
               );
             }) })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-2 mb-1", children: [
+              /* @__PURE__ */ jsx("label", { className: "text-xs font-bold text-zinc-800 dark:text-zinc-200", children: "\u63CF\u8FF0" }),
+              /* @__PURE__ */ jsxs(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => setFullscreenData({ title: "\u63CF\u8FF0", content: activeDetailCard.screenshots?.authorsNoteDescription || "", type: "text" }),
+                  className: "text-[11px] text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex items-center gap-1",
+                  children: [
+                    /* @__PURE__ */ jsx(Maximize2, { className: "w-3 h-3" }),
+                    " \u653E\u5927\u67E5\u770B"
+                  ]
+                }
+              )
+            ] }),
+            /* @__PURE__ */ jsx(
+              "textarea",
+              {
+                defaultValue: activeDetailCard.screenshots?.authorsNoteDescription || "",
+                rows: 5,
+                onBlur: (e) => {
+                  const value = e.target.value;
+                  const updatedCards = appData.cards.map((c) => c.id === activeDetailCard.id ? {
+                    ...c,
+                    screenshots: {
+                      authorsNote: c.screenshots?.authorsNote || [],
+                      authorsNoteDescription: value,
+                      favoriteScenes: c.screenshots?.favoriteScenes || []
+                    },
+                    updatedAt: Date.now()
+                  } : c);
+                  updateAppData({ ...appData, cards: updatedCards });
+                  showToast("\u4F5C\u8005\u7684\u8BDD\u63CF\u8FF0\u5DF2\u4FDD\u5B58", "success");
+                },
+                placeholder: "\u586B\u5199\u4F5C\u8005\u7684\u8BDD\u76F8\u5173\u63CF\u8FF0\uFF0C\u53EF\u8F93\u5165\u957F\u6587\u672C...",
+                className: "w-full min-h-[120px] px-3 py-2 text-xs leading-relaxed bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-xl resize-y focus:outline-none focus:ring-1 focus:ring-zinc-400"
+              }
+            )
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "space-y-3 pt-4 border-t border-zinc-200 dark:border-zinc-800", children: [
             /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center justify-between gap-2", children: [
@@ -9515,7 +10299,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                           (_, idx) => !selectedMemoryIndices.includes(idx)
                         );
                         const updatedCards = appData.cards.map(
-                          (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { authorsNote: c.screenshots?.authorsNote || [], favoriteScenes: updatedScenes } } : c
+                          (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { authorsNote: c.screenshots?.authorsNote || [], authorsNoteDescription: c.screenshots?.authorsNoteDescription || "", favoriteScenes: updatedScenes } } : c
                         );
                         updateAppData({ ...appData, cards: updatedCards });
                         setSelectedMemoryIndices([]);
@@ -9590,7 +10374,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
                           e.stopPropagation();
                           const updatedScenes = activeDetailCard.screenshots.favoriteScenes.filter((_, i) => i !== idx);
                           const updatedCards = appData.cards.map(
-                            (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { authorsNote: c.screenshots?.authorsNote || [], favoriteScenes: updatedScenes } } : c
+                            (c) => c.id === activeDetailCard.id ? { ...c, screenshots: { authorsNote: c.screenshots?.authorsNote || [], authorsNoteDescription: c.screenshots?.authorsNoteDescription || "", favoriteScenes: updatedScenes } } : c
                           );
                           updateAppData({ ...appData, cards: updatedCards });
                           showToast("\u7167\u7247\u5DF2\u5220\u9664", "info");
@@ -9777,7 +10561,7 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             ] }, `${item.id ?? i}-${i}`)) }) : /* @__PURE__ */ jsx("div", { className: "text-center py-10 text-xs text-zinc-400 border border-dashed border-zinc-200 dark:border-zinc-800 rounded-2xl", children: "\u6682\u65E0 QR \u6761\u76EE" })
           ] });
         })()
-      ] }, detailTab),
+      ] }) }),
       /* @__PURE__ */ jsxs("div", { className: "px-6 py-3 border-t border-zinc-200 dark:border-zinc-800 flex items-center justify-between flex-shrink-0 bg-zinc-50/50 dark:bg-zinc-900/50", children: [
         /* @__PURE__ */ jsxs(
           "button",
@@ -15819,8 +16603,8 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
         )
       ] })
     ] }) }),
-    extraStoryImportPreview && /* @__PURE__ */ jsx("div", { className: "fixed inset-0 z-[89] flex items-center justify-center bg-black/60 p-3 pt-[calc(0.75rem+env(safe-area-inset-top,0px))]", children: /* @__PURE__ */ jsxs("div", { className: "w-full max-w-3xl max-h-[88vh] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col", children: [
-      /* @__PURE__ */ jsxs("div", { className: "p-4 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3", children: [
+    extraStoryImportPreview && /* @__PURE__ */ jsx("div", { className: "fixed inset-0 z-[89] flex items-center justify-center bg-black/60 p-3 pt-[calc(0.75rem+env(safe-area-inset-top,0px))]", children: /* @__PURE__ */ jsxs("div", { className: "w-full max-w-3xl max-h-[88vh] bg-white dark:bg-zinc-900 border border-[#E4E4E7] border-[#E4E4E7] dark:border-[#E4E4E7] rounded-2xl shadow-2xl overflow-hidden flex flex-col", children: [
+      /* @__PURE__ */ jsxs("div", { className: "p-4 border-b border-[#E4E4E7] dark:border-[#E4E4E7] flex items-center justify-between gap-3", children: [
         /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
           /* @__PURE__ */ jsx("h3", { className: "text-sm font-bold truncate", children: "\u9884\u89C8\u5BFC\u5165\u756A\u5916" }),
           /* @__PURE__ */ jsxs("p", { className: "text-[11px] text-zinc-400 mt-0.5", children: [
@@ -15836,38 +16620,42 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
           setSelectedExtraStoryImportIds([]);
         }, className: "p-1 text-zinc-400", children: /* @__PURE__ */ jsx(X, { className: "w-4 h-4" }) })
       ] }),
-      /* @__PURE__ */ jsxs("div", { className: "px-4 py-2 border-b border-zinc-100 dark:border-zinc-800 flex flex-wrap items-center gap-2", children: [
-        /* @__PURE__ */ jsx("button", { onClick: () => setSelectedExtraStoryImportIds(extraStoryImportPreview.map((e) => e.id)), className: "px-2.5 py-1.5 text-xs rounded-lg border", children: "\u5168\u9009" }),
-        /* @__PURE__ */ jsx("button", { onClick: () => setSelectedExtraStoryImportIds([]), className: "px-2.5 py-1.5 text-xs rounded-lg border", children: "\u53D6\u6D88\u5168\u9009" }),
-        /* @__PURE__ */ jsx("button", { onClick: mergeSelectedExtraStoryImports, disabled: selectedExtraStoryImportIds.length < 2, className: "px-2.5 py-1.5 text-xs rounded-lg border disabled:opacity-40", children: "\u878D\u5408\u6240\u9009" }),
+      /* @__PURE__ */ jsxs("div", { className: "px-4 py-2 border-b border-[#E4E4E7] dark:border-[#E4E4E7] flex flex-wrap items-center gap-2", children: [
+        /* @__PURE__ */ jsx("button", { onClick: () => setSelectedExtraStoryImportIds(extraStoryImportPreview.map((e) => e.id)), className: "px-2.5 py-1.5 text-xs rounded-lg border border-[#E4E4E7]", children: "\u5168\u9009" }),
+        /* @__PURE__ */ jsx("button", { onClick: () => setSelectedExtraStoryImportIds([]), className: "px-2.5 py-1.5 text-xs rounded-lg border border-[#E4E4E7]", children: "\u53D6\u6D88\u5168\u9009" }),
+        /* @__PURE__ */ jsx("button", { onClick: mergeSelectedExtraStoryImports, disabled: selectedExtraStoryImportIds.length < 2, className: "px-2.5 py-1.5 text-xs rounded-lg border border-[#E4E4E7] disabled:opacity-40", children: "\u878D\u5408\u6240\u9009" }),
         /* @__PURE__ */ jsx("span", { className: "text-[11px] text-zinc-400 ml-auto", children: "\u53EF\u76F4\u63A5\u7F16\u8F91\uFF1B\u9009\u62E9\u540E\u53EA\u5BFC\u5165\u9009\u4E2D\u7684\u6761\u76EE" })
       ] }),
       /* @__PURE__ */ jsxs("div", { className: "p-4 overflow-y-auto space-y-3", children: [
         extraStoryImportPreview.slice(0, extraStoryImportVisibleCount).map((item, index) => {
           const selected = selectedExtraStoryImportIds.includes(item.id);
-          return /* @__PURE__ */ jsxs("div", { className: `rounded-xl border p-3 ${selected ? "border-zinc-300 dark:border-zinc-700" : "border-zinc-200 dark:border-zinc-800 opacity-60"}`, children: [
+          return /* @__PURE__ */ jsxs("div", { className: `rounded-xl border border-[#E4E4E7] p-3 ${selected ? "border-[#E4E4E7] dark:border-[#E4E4E7]" : "border-[#E4E4E7] dark:border-[#E4E4E7] opacity-60"}`, children: [
             /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 mb-2", children: [
+              /* @__PURE__ */ jsx("button", { type: "button", onClick: (e) => {
+                e.stopPropagation();
+                removeExtraStoryImportPreviewItem(item.id);
+              }, className: "ml-auto order-last flex-shrink-0 w-7 h-7 rounded-lg border border-[#E4E4E7] border-[#E4E4E7] dark:border-[#E4E4E7] text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center", title: "\u5220\u9664\u6B64\u9884\u89C8\uFF0C\u4E0D\u5BFC\u5165", children: /* @__PURE__ */ jsx(Trash2, { className: "w-3.5 h-3.5" }) }),
               /* @__PURE__ */ jsx("button", { onClick: () => toggleExtraStoryImportSelection(item.id), className: "flex-shrink-0", title: selected ? "\u53D6\u6D88\u5BFC\u5165" : "\u9009\u62E9\u5BFC\u5165", children: selected ? /* @__PURE__ */ jsx(CheckCircle2, { className: "w-5 h-5 text-zinc-900 dark:text-zinc-100" }) : /* @__PURE__ */ jsx(Circle, { className: "w-5 h-5 text-zinc-400" }) }),
               /* @__PURE__ */ jsxs("span", { className: "text-[11px] text-zinc-400", children: [
                 "#",
                 index + 1
               ] }),
-              /* @__PURE__ */ jsx("input", { value: item.title, onChange: (e) => updateExtraStoryImportPreviewItem(item.id, { title: e.target.value }), className: "flex-1 min-w-0 px-2.5 py-1.5 text-xs font-semibold rounded-lg border bg-zinc-50 dark:bg-zinc-800/60 border-zinc-200 dark:border-zinc-700", placeholder: "\u756A\u5916\u540D\u79F0" })
+              /* @__PURE__ */ jsx("input", { value: item.title, onChange: (e) => updateExtraStoryImportPreviewItem(item.id, { title: e.target.value }), className: "flex-1 min-w-0 px-2.5 py-1.5 text-xs font-semibold rounded-lg border border-[#E4E4E7] bg-zinc-50 dark:bg-zinc-800/60 border-[#E4E4E7] dark:border-[#E4E4E7]", placeholder: "\u756A\u5916\u540D\u79F0" })
             ] }),
-            /* @__PURE__ */ jsx("textarea", { value: item.content, onChange: (e) => updateExtraStoryImportPreviewItem(item.id, { content: e.target.value }), className: "w-full min-h-[120px] px-3 py-2 text-xs leading-relaxed rounded-xl border bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-700 resize-y focus:outline-none" })
+            /* @__PURE__ */ jsx("textarea", { value: item.content, onChange: (e) => updateExtraStoryImportPreviewItem(item.id, { content: e.target.value }), className: "w-full min-h-[120px] px-3 py-2 text-xs leading-relaxed rounded-xl border border-[#E4E4E7] bg-white dark:bg-zinc-900 border-[#E4E4E7] dark:border-[#E4E4E7] resize-y focus:outline-none" })
           ] }, item.id);
         }),
-        extraStoryImportVisibleCount < extraStoryImportPreview.length && /* @__PURE__ */ jsxs("button", { onClick: () => setExtraStoryImportVisibleCount((n) => Math.min(n + 60, extraStoryImportPreview.length)), className: "w-full py-2.5 text-xs rounded-xl border border-dashed text-zinc-500 hover:bg-zinc-50 dark:hover:bg-zinc-800", children: [
+        extraStoryImportVisibleCount < extraStoryImportPreview.length && /* @__PURE__ */ jsxs("button", { onClick: () => setExtraStoryImportVisibleCount((n) => Math.min(n + 60, extraStoryImportPreview.length)), className: "w-full py-2.5 text-xs rounded-xl border border-[#E4E4E7] border-dashed text-zinc-500 hover:bg-zinc-50 dark:hover:bg-zinc-800", children: [
           "\u7EE7\u7EED\u663E\u793A\u540E\u9762\u7684 ",
           Math.min(60, extraStoryImportPreview.length - extraStoryImportVisibleCount),
           " \u6761"
         ] })
       ] }),
-      /* @__PURE__ */ jsxs("div", { className: "p-4 border-t border-zinc-200 dark:border-zinc-800 flex justify-end gap-2", children: [
+      /* @__PURE__ */ jsxs("div", { className: "p-4 border-t border-[#E4E4E7] dark:border-[#E4E4E7] flex justify-end gap-2", children: [
         /* @__PURE__ */ jsx("button", { onClick: () => {
           setExtraStoryImportPreview(null);
           setSelectedExtraStoryImportIds([]);
-        }, className: "px-4 py-2 text-xs rounded-lg border", children: "\u53D6\u6D88" }),
+        }, className: "px-4 py-2 text-xs rounded-lg border border-[#E4E4E7]", children: "\u53D6\u6D88" }),
         /* @__PURE__ */ jsxs("button", { onClick: commitSelectedExtraStoryImports, disabled: !selectedExtraStoryImportIds.length, className: "px-4 py-2 text-xs font-bold rounded-lg bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 disabled:opacity-40", children: [
           "\u786E\u5B9A\u5BFC\u5165\uFF08",
           selectedExtraStoryImportIds.length,
@@ -15908,7 +16696,10 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             const q = jsonWorldBookSearchQuery.trim().toLowerCase();
             if (q && !`${label} ${content}`.toLowerCase().includes(q)) return null;
             return /* @__PURE__ */ jsxs("div", { className: "p-3 border rounded-xl border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50", children: [
-              /* @__PURE__ */ jsx("div", { className: "text-xs font-bold", children: label }),
+              /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-2", children: [
+                /* @__PURE__ */ jsx("div", { className: "text-xs font-bold truncate", children: label }),
+                /* @__PURE__ */ jsx("button", { type: "button", onClick: () => setFullscreenData({ title: label, content, type: "text" }), className: "p-1 text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100 flex-shrink-0", title: "\u653E\u5927\u5C55\u5F00", children: /* @__PURE__ */ jsx(Maximize2, { className: "w-3.5 h-3.5" }) })
+              ] }),
               /* @__PURE__ */ jsx("div", { className: "text-[11px] text-zinc-500 mt-1 whitespace-pre-wrap line-clamp-5", children: content })
             ] }, i);
           }) })
@@ -16017,10 +16808,16 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             if (q && !`${label} ${keys} ${content}`.toLowerCase().includes(q)) return null;
             return /* @__PURE__ */ jsxs("div", { className: "p-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/50", children: [
               /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-2", children: [
-                /* @__PURE__ */ jsx("div", { className: "text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate", children: label }),
-                /* @__PURE__ */ jsxs("span", { className: "text-[10px] text-zinc-400 flex-shrink-0", children: [
-                  "#",
-                  i + 1
+                /* @__PURE__ */ jsx("div", { className: "text-xs font-bold text-zinc-900 dark:text-zinc-100 truncate min-w-0", children: label }),
+                /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-1.5 flex-shrink-0", children: [
+                  /* @__PURE__ */ jsxs("span", { className: "text-[10px] text-zinc-400", children: [
+                    "#",
+                    i + 1
+                  ] }),
+                  /* @__PURE__ */ jsxs("button", { type: "button", onClick: () => setFullscreenData({ title: label, content, type: "text" }), className: "px-2 py-1 text-[10px] font-semibold rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center gap-1", children: [
+                    /* @__PURE__ */ jsx(Maximize2, { className: "w-3 h-3" }),
+                    "\u653E\u5927\u5C55\u5F00"
+                  ] })
                 ] })
               ] }),
               keys && /* @__PURE__ */ jsxs("div", { className: "text-[10px] text-zinc-400 mt-1 truncate", children: [
@@ -16753,7 +17550,8 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
             chatImportPreview.length,
             " \u6761\uFF09"
           ] }),
-          chatImportPreview.map((m, i) => /* @__PURE__ */ jsxs("div", { className: "p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 text-xs leading-relaxed whitespace-pre-wrap", children: [
+          chatImportPreview.map((m, i) => /* @__PURE__ */ jsxs("div", { className: "relative p-3 pr-10 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 border border-zinc-200 dark:border-zinc-700 text-xs leading-relaxed whitespace-pre-wrap", children: [
+            /* @__PURE__ */ jsx("button", { type: "button", onClick: () => removeChatImportPreviewItem(m.id), className: "absolute top-2 right-2 w-6 h-6 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-500 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800", title: "\u5220\u9664\u6B64\u9884\u89C8\uFF0C\u4E0D\u5BFC\u5165", children: /* @__PURE__ */ jsx(Trash2, { className: "w-3.5 h-3.5" }) }),
             /* @__PURE__ */ jsxs("span", { className: "text-[10px] text-zinc-400 block mb-1", children: [
               "\u804A\u5929\u6897 ",
               i + 1
@@ -16794,7 +17592,8 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
       ] }) }),
       /* @__PURE__ */ jsx("div", { className: "p-4 overflow-y-auto space-y-2", children: chatImportPreview.map((m, i) => {
         const checked = selectedChatImportIds.includes(m.id);
-        return /* @__PURE__ */ jsxs("div", { className: `p-3 rounded-xl border text-xs leading-relaxed ${checked ? "border-zinc-900 dark:border-zinc-100 ring-1 ring-zinc-900/10" : "border-zinc-200 dark:border-zinc-700"} bg-zinc-50 dark:bg-zinc-800/60`, children: [
+        return /* @__PURE__ */ jsxs("div", { className: `relative p-3 pr-10 rounded-xl border text-xs leading-relaxed ${checked ? "border-zinc-900 dark:border-zinc-100 ring-1 ring-zinc-900/10" : "border-zinc-200 dark:border-zinc-700"} bg-zinc-50 dark:bg-zinc-800/60`, children: [
+          /* @__PURE__ */ jsx("button", { type: "button", onClick: () => removeChatImportPreviewItem(m.id), className: "absolute top-2 right-2 w-6 h-6 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-500 flex items-center justify-center hover:bg-zinc-100 dark:hover:bg-zinc-800", title: "\u5220\u9664\u6B64\u9884\u89C8\uFF0C\u4E0D\u5BFC\u5165", children: /* @__PURE__ */ jsx(Trash2, { className: "w-3.5 h-3.5" }) }),
           /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 mb-2", children: [
             /* @__PURE__ */ jsx("button", { onClick: () => toggleChatImportSelection(m.id), className: `w-5 h-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${checked ? "bg-zinc-900 dark:bg-zinc-100 border-zinc-900 dark:border-zinc-100" : "border-zinc-300 dark:border-zinc-600"}`, children: checked && /* @__PURE__ */ jsx(Check, { className: "w-3 h-3 text-white dark:text-zinc-900" }) }),
             /* @__PURE__ */ jsxs("span", { className: "text-[10px] text-zinc-400", children: [
@@ -17154,6 +17953,23 @@ ${item.details}`], { type: "text/plain;charset=utf-8" });
           setEditingImageGen(null);
         }, className: "px-4 py-2.5 text-xs bg-rose-600 text-white rounded-xl", children: "\u5220\u9664" }),
         /* @__PURE__ */ jsx("button", { onClick: saveImageGen, className: "px-5 py-2.5 text-xs bg-zinc-900 text-white rounded-xl", children: "\u786E\u5B9A" })
+      ] })
+    ] }) }),
+    showGithubBackupReminder && /* @__PURE__ */ jsx("div", { className: "fixed inset-0 z-[180] flex items-center justify-center bg-black/50 p-4 pt-[calc(1rem+env(safe-area-inset-top,0px))] pb-[calc(1rem+env(safe-area-inset-bottom,0px))]", children: /* @__PURE__ */ jsxs("div", { className: "w-full max-w-sm bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl p-5", children: [
+      /* @__PURE__ */ jsxs("div", { className: "flex items-start gap-3", children: [
+        /* @__PURE__ */ jsx("div", { className: "w-9 h-9 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center flex-shrink-0", children: /* @__PURE__ */ jsx(Github, { className: "w-4 h-4" }) }),
+        /* @__PURE__ */ jsxs("div", { children: [
+          /* @__PURE__ */ jsx("h3", { className: "text-sm font-bold", children: "\u8BE5\u5907\u4EFD GitHub \u4E86" }),
+          /* @__PURE__ */ jsx("p", { className: "text-xs text-zinc-500 dark:text-zinc-400 mt-1.5 leading-5", children: "\u5DF2\u7ECF\u8D85\u8FC7 2 \u5929\u6CA1\u6709\u5B8C\u6210 GitHub \u5907\u4EFD\u3002\u5EFA\u8BAE\u73B0\u5728\u5907\u4EFD\u4E00\u6B21\uFF0C\u907F\u514D\u6570\u636E\u4E22\u5931\u3002" })
+        ] })
+      ] }),
+      /* @__PURE__ */ jsxs("div", { className: "flex gap-2 mt-5", children: [
+        /* @__PURE__ */ jsx("button", { type: "button", onClick: () => setShowGithubBackupReminder(false), className: "flex-1 px-3 py-2.5 rounded-xl border border-zinc-200 dark:border-zinc-700 text-xs font-medium", children: "\u786E\u8BA4" }),
+        /* @__PURE__ */ jsx("button", { type: "button", onClick: () => {
+          setShowGithubBackupReminder(false);
+          setCurrentPage("settings");
+          setSidebarOpen(false);
+        }, className: "flex-1 px-3 py-2.5 rounded-xl bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-semibold", children: "\u5907\u4EFD" })
       ] })
     ] }) }),
     /* @__PURE__ */ jsx("div", { className: "fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] flex flex-col-reverse items-center gap-2 pointer-events-none toast-container pb-[env(safe-area-inset-bottom,0px)]", children: toasts.map((t) => /* @__PURE__ */ jsx(
